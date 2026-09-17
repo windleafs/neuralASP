@@ -6,7 +6,12 @@ This diagnostic complements ``visualize_phase_screen_checkpoint.py``:
 * imaging/metrics use the full contiguous band by default;
 * a shared TGC curve is estimated only from the Uniform image and applied to
   every candidate identically;
+* the shared-TGC figure includes the true scatterer magnitude |m| as a fifth
+  panel with its own normalization (truth and migrated-image amplitudes are not
+  in the same units);
 * difference maps show local amplitude change relative to Uniform;
+* depth-wise corr / holdout agreement / coherence are reported over configurable
+  depth bins so shallow high-SNR content cannot dominate the global metric;
 * the default validation sweep evaluates 10 samples per case (20 total) and
   reports mean/median delta-hold, win counts, and case-wise summaries.
 """
@@ -26,7 +31,8 @@ import torch
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
-from common import demod_iq, rf_to_D  # noqa: E402
+from common import corr2d, demod_iq, rf_to_D  # noqa: E402
+from models.phase_screen import coherence, heldout_agreement  # noqa: E402
 from train_phase_screen import sample_ids  # noqa: E402
 from scripts.pilot_phase_asp import DATA_ROOT, embed  # noqa: E402
 from scripts.visualize_phase_screen_checkpoint import (  # noqa: E402
@@ -75,18 +81,21 @@ def to_db(image: torch.Tensor, ref: float, db_range: float):
     return np.clip(db, -db_range, 0.0)
 
 
-def save_tgc_figure(path, sample_id, images, metrics, cfg, meta, born, pad,
-                    db_range, dpi, smooth_rows, max_gain_db):
+def save_tgc_figure(path, sample_id, images, truth_abs, metrics,
+                    cfg, meta, born, pad, db_range, dpi,
+                    smooth_rows, max_gain_db):
+    """Four migrated images on one shared scale + independently scaled truth."""
     names = ["uniform", "network", "teacher", "gt_speed_asm"]
     titles = ["Uniform", "Network", "Teacher", "GT-speed ASP"]
     gain = shared_tgc(images["uniform"], smooth_rows, max_gain_db)
     gained = {name: images[name] * gain[:, None] for name in names}
     ref_amp = max(float(gained[name].abs().max()) for name in names)
+    truth_ref = max(float(truth_abs.abs().max()), 1e-12)
     x0, x1, z0, z1 = axis_coordinates(cfg, meta, born, pad)
 
-    fig, axes = plt.subplots(1, 4, figsize=(15.5, 5.0), constrained_layout=True)
+    fig, axes = plt.subplots(1, 5, figsize=(18.7, 5.0), constrained_layout=True)
     im = None
-    for ax, name, title in zip(axes, names, titles):
+    for ax, name, title in zip(axes[:4], names, titles):
         im = ax.imshow(
             to_db(gained[name], ref_amp, db_range), cmap="gray",
             vmin=-db_range, vmax=0, origin="upper",
@@ -95,8 +104,19 @@ def save_tgc_figure(path, sample_id, images, metrics, cfg, meta, born, pad,
         ax.set_title(f"{title}\nΔhold={dh:+.4f}", fontsize=10)
         ax.set_xlabel("Lateral x [mm]")
         ax.set_ylabel("Depth z [mm]")
-    fig.colorbar(im, ax=axes, shrink=0.84, pad=0.015,
-                 label="Shared-TGC amplitude [dB]")
+
+    truth_im = axes[4].imshow(
+        to_db(truth_abs, truth_ref, db_range), cmap="gray",
+        vmin=-db_range, vmax=0, origin="upper",
+        extent=[x0, x1, z1, z0], aspect="auto")
+    axes[4].set_title("Truth |m|\nindependent scale", fontsize=10)
+    axes[4].set_xlabel("Lateral x [mm]")
+    axes[4].set_ylabel("Depth z [mm]")
+
+    fig.colorbar(im, ax=axes[:4], shrink=0.84, pad=0.012,
+                 label="Shared-TGC migrated amplitude [dB]")
+    fig.colorbar(truth_im, ax=axes[4], shrink=0.84, pad=0.012,
+                 label="Truth |m| [dB, own scale]")
     fig.suptitle(
         f"{sample_id}: shared TGC from Uniform only | max gain={max_gain_db:.0f} dB",
         fontsize=13)
@@ -141,9 +161,86 @@ def save_difference_figure(path, sample_id, images, metrics, cfg, meta, born,
     plt.close(fig)
 
 
+def validate_depth_edges(edges):
+    vals = [float(v) for v in edges]
+    if len(vals) < 2:
+        raise ValueError("depth bins require at least two edges")
+    if any(b <= a for a, b in zip(vals[:-1], vals[1:])):
+        raise ValueError("depth-bin edges must be strictly increasing")
+    return vals
+
+
+def depth_windows(edges):
+    return [(float(a), float(b), f"{a:g}-{b:g}mm")
+            for a, b in zip(edges[:-1], edges[1:])]
+
+
+def depth_row_mask(born, z_lo_mm, z_hi_mm, device):
+    z_mm = (float(born.z0) +
+            torch.arange(born.nz, device=device, dtype=torch.float32)
+            * float(born.dz)) * 1e3
+    return (z_mm >= z_lo_mm) & (z_mm < z_hi_mm)
+
+
+def depth_reference(uniform_per_angle, base_mask, train_idx, hold_idx,
+                    row_mask):
+    """Uniform-derived ROI mask/scales recomputed independently per depth bin."""
+    roi_mask = base_mask.clone()
+    roi_mask[:, ~row_mask, :] = 0
+    train = uniform_per_angle[:, train_idx]
+    hold = uniform_per_angle[:, hold_idx]
+    tr_scale = (train.abs().square() * roi_mask[:, None]).sum(dim=(-2, -1))\
+        .sqrt().clamp_min(1e-30)
+    ho_scale = (hold.abs().square() * roi_mask[:, None]).sum(dim=(-2, -1))\
+        .sqrt().clamp_min(1e-30)
+    return {
+        "mask": roi_mask,
+        "train_scales": tr_scale,
+        "hold_scales": ho_scale,
+    }
+
+
+def depth_metric_for_candidate(per_angle, truth_abs, ref, train_idx, hold_idx,
+                               row_mask, pad):
+    train = per_angle[:, train_idx]
+    hold = per_angle[:, hold_idx]
+    coh = coherence(train, ref["mask"], ref["train_scales"])[0]
+    hold_score = heldout_agreement(
+        train, hold, ref["mask"], ref["train_scales"],
+        ref["hold_scales"])[0]
+    image = compound(per_angle, pad)
+    image_roi = image[row_mask]
+    truth_roi = truth_abs[row_mask]
+    corr = corr2d(image_roi.abs(), truth_roi)
+    return {
+        "input_coherence": float(coh),
+        "holdout_agreement": float(hold_score),
+        "image_abs_corr": float(corr),
+    }
+
+
+def compute_depth_metrics(per_angle_images, truth_abs, global_ref,
+                          train_idx, hold_idx, born, pad, edges):
+    result = {}
+    uniform_per_angle = per_angle_images["uniform"]
+    for z_lo, z_hi, label in depth_windows(edges):
+        row_mask = depth_row_mask(born, z_lo, z_hi, uniform_per_angle.device)
+        if int(row_mask.sum()) < 2:
+            result[label] = {"error": "fewer than two depth rows"}
+            continue
+        ref = depth_reference(
+            uniform_per_angle, global_ref["mask"], train_idx, hold_idx, row_mask)
+        result[label] = {
+            name: depth_metric_for_candidate(
+                imgs, truth_abs, ref, train_idx, hold_idx, row_mask, pad)
+            for name, imgs in per_angle_images.items()
+        }
+    return result
+
+
 @torch.no_grad()
 def evaluate_one(sample_id, model, pred_meta, imaging_cfg, imaging_meta,
-                 imaging_born, device, top_frac, out_dir, args):
+                 imaging_born, device, top_frac, out_dir, args, depth_edges):
     sample = torch.load(DATA_ROOT / "shards" / f"{sample_id}.pt",
                         map_location="cpu", weights_only=False)
     rf = sample["rf"][None].to(device)
@@ -164,7 +261,7 @@ def evaluate_one(sample_id, model, pred_meta, imaging_cfg, imaging_meta,
     train_idx = torch.as_tensor(imaging_meta.train_idx, device=device)
     hold_idx = torch.as_tensor(imaging_meta.hold_idx, device=device)
     all_idx = torch.arange(D.shape[1], device=device)
-    ref = fixed_reference(
+    global_ref = fixed_reference(
         imaging_born, D, train_idx, hold_idx, model.pad, top_frac)
 
     zero_ds = torch.zeros_like(network_ds)
@@ -176,16 +273,21 @@ def evaluate_one(sample_id, model, pred_meta, imaging_cfg, imaging_meta,
     }
     metrics = {}
     images = {}
+    per_angle_images = {}
     truth_abs = sample["m"].abs().to(device)
     for name, ds in candidates_ds.items():
         per_angle = angle_images(imaging_born, ds, D, all_idx)
+        per_angle_images[name] = per_angle
         metrics[name], images[name] = score_candidate(
-            per_angle, ref, train_idx, hold_idx, truth_abs, model.pad)
-        del per_angle
+            per_angle, global_ref, train_idx, hold_idx, truth_abs, model.pad)
+
+    depth_metrics = compute_depth_metrics(
+        per_angle_images, truth_abs, global_ref,
+        train_idx, hold_idx, imaging_born, model.pad, depth_edges)
 
     save_tgc_figure(
-        out_dir / f"{sample_id}_shared_tgc.png", sample_id, images, metrics,
-        imaging_cfg, imaging_meta, imaging_born, model.pad,
+        out_dir / f"{sample_id}_shared_tgc.png", sample_id, images, truth_abs,
+        metrics, imaging_cfg, imaging_meta, imaging_born, model.pad,
         args.db_range, args.dpi, args.tgc_smooth_rows, args.tgc_max_gain_db)
     save_difference_figure(
         out_dir / f"{sample_id}_difference.png", sample_id, images, metrics,
@@ -201,6 +303,7 @@ def evaluate_one(sample_id, model, pred_meta, imaging_cfg, imaging_meta,
         "sample": sample_id,
         "case": sample["metadata"].get("case"),
         "metrics": metrics,
+        "depth_metrics": depth_metrics,
         "delta_hold_vs_uniform": deltas,
         "figures": {
             "shared_tgc": f"{sample_id}_shared_tgc.png",
@@ -235,6 +338,44 @@ def summarize_by_case(rows):
     return {key: summarize(group) for key, group in groups.items()}
 
 
+def summarize_depth(rows, depth_edges):
+    methods = ("uniform", "network", "teacher", "gt_speed_asm")
+    out = {}
+    for _, _, label in depth_windows(depth_edges):
+        valid = [r for r in rows if "error" not in r["depth_metrics"].get(label, {})]
+        if not valid:
+            out[label] = {"error": "no valid samples"}
+            continue
+        block = {}
+        for method in methods:
+            block[method] = {
+                metric: float(np.mean([
+                    r["depth_metrics"][label][method][metric] for r in valid
+                ]))
+                for metric in ("input_coherence", "holdout_agreement", "image_abs_corr")
+            }
+        for method in ("network", "teacher", "gt_speed_asm"):
+            d_hold = np.asarray([
+                r["depth_metrics"][label][method]["holdout_agreement"] -
+                r["depth_metrics"][label]["uniform"]["holdout_agreement"]
+                for r in valid
+            ], dtype=float)
+            d_corr = np.asarray([
+                r["depth_metrics"][label][method]["image_abs_corr"] -
+                r["depth_metrics"][label]["uniform"]["image_abs_corr"]
+                for r in valid
+            ], dtype=float)
+            block[method]["mean_delta_hold_vs_uniform"] = float(d_hold.mean())
+            block[method]["median_delta_hold_vs_uniform"] = float(np.median(d_hold))
+            block[method]["hold_wins"] = int((d_hold > 0).sum())
+            block[method]["mean_delta_corr_vs_uniform"] = float(d_corr.mean())
+            block[method]["median_delta_corr_vs_uniform"] = float(np.median(d_corr))
+            block[method]["corr_wins"] = int((d_corr > 0).sum())
+        block["n"] = len(valid)
+        out[label] = block
+    return out
+
+
 def ranking(rows, method):
     ordered = sorted(
         rows, key=lambda r: r["delta_hold_vs_uniform"][method], reverse=True)
@@ -262,12 +403,21 @@ def main():
     p.add_argument("--tgc-max-gain-db", type=float, default=30.0)
     p.add_argument("--diff-mask-floor-db", type=float, default=-50.0)
     p.add_argument("--diff-clip-db", type=float, default=6.0)
+    p.add_argument(
+        "--depth-bin-edges-mm", type=float, nargs="+",
+        default=[3.0, 10.0, 20.0, 30.0, 35.0],
+        help="consecutive depth-bin edges; default excludes <3 mm and >35 mm",
+    )
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
     if args.per_case < 1:
         p.error("--per-case must be >= 1")
     if args.db_range <= 0 or args.diff_clip_db <= 0:
         p.error("display dB ranges must be positive")
+    try:
+        depth_edges = validate_depth_edges(args.depth_bin_edges_mm)
+    except ValueError as exc:
+        p.error(str(exc))
 
     ids = args.sample_ids if args.sample_ids else sample_ids(args.split, args.per_case)
     args.out.mkdir(parents=True, exist_ok=True)
@@ -289,7 +439,7 @@ def main():
     for i, sample_id in enumerate(ids, 1):
         row = evaluate_one(
             sample_id, model, pred_meta, imaging_cfg, imaging_meta,
-            imaging_born, device, args.top_frac, args.out, args)
+            imaging_born, device, args.top_frac, args.out, args, depth_edges)
         rows.append(row)
         print(json.dumps({
             "event": "evaluated",
@@ -304,9 +454,11 @@ def main():
         "checkpoint": str(args.checkpoint),
         "step": int(ckpt["step"]),
         "frequency_sampling": freq_info,
+        "depth_bin_edges_mm": depth_edges,
         "samples": ids,
         "summary": summarize(rows),
         "summary_by_case": summarize_by_case(rows),
+        "depth_summary": summarize_depth(rows, depth_edges),
         "ranking": {
             method: ranking(rows, method)
             for method in ("network", "teacher", "gt_speed_asm")
@@ -319,6 +471,7 @@ def main():
         "event": "done",
         "out": str(args.out),
         "summary": payload["summary"],
+        "depth_summary": payload["depth_summary"],
     }), flush=True)
 
 
