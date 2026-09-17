@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from common import D_to_rf, demod_iq, rf_to_D
-from physics.imaging import BornModel
+from physics.oversampled_imaging import LateralOversampledBornModel
 from models.neural_operator import NeuralOperator
 
 __all__ = ["ImagingPipeline", "ComplexProx"]
@@ -56,9 +56,12 @@ class ImagingPipeline(nn.Module):
         self.cfg = cfg
         self.meta = meta
         g = cfg.grid
-        self.born = BornModel(meta, g.nx, g.nz, g.dx, g.dz, cfg.physics.c0,
-                              dtype=dtype, eps=cfg.physics.eps_evanescent,
-                              spreading=cfg.physics.spreading)
+        self.born = LateralOversampledBornModel(
+            meta, g.nx, g.nz, g.dx, g.dz, cfg.physics.c0,
+            dtype=dtype, eps=cfg.physics.eps_evanescent,
+            spreading=cfg.physics.spreading,
+            lateral_oversample=int(cfg.physics.get("lateral_oversample", 1)),
+        )
         self.neural_operator = NeuralOperator(cfg, meta, g.nx, g.nz, g.dx, g.dz)
         m = cfg.model
         self.prox = nn.ModuleList(
@@ -67,24 +70,16 @@ class ImagingPipeline(nn.Module):
             [1.0] + [0.3] * m.n_unroll))
         self.m_rms_ref = m.m_rms_ref
         self.s0 = 1.0 / cfg.physics.c0
-        # diagonal illumination preconditioning of the adjoint (whitens the
-        # depth/lateral sensitivity of the correlation imaging condition);
-        # set illum_compensate: false for the plain sum_{theta,omega} u* v
         self.illum_compensate = bool(cfg.model.get("illum_compensate", True))
-        self.operator_version = "l11_consistency_v2"
+        self.operator_version = "l11_consistency_v3_oversampled_asp"
         weight = meta.win if meta.get("response_mode", "legacy_window") == "legacy_window" else np.ones(len(meta.freqs))
         self.register_buffer("measurement_weight", torch.as_tensor(weight, dtype=dtype).view(1, -1, 1))
 
-    # ---------------------------------------------------------------- helpers
     def _normalize(self, img):
-        """Scale an adjoint image to the reference RMS magnitude (scale
-        detached: only the direction carries gradient)."""
         rms = img.abs().pow(2).mean(dim=(-2, -1), keepdim=True).sqrt().detach()
         return img * (self.m_rms_ref / (rms + 1e-9))
 
     def _fadj(self, D, u_tx, ds_fine):
-        """Adjoint image, optionally illumination-compensated
-        (diag preconditioner of the normal operator)."""
         img = self.born.adjoint(D * self.measurement_weight.conj(), u_tx, ds_fine)
         if not self.illum_compensate:
             return img
@@ -93,7 +88,6 @@ class ImagingPipeline(nn.Module):
         return img / den
 
     def _estimate_m(self, D_tr, ds_fine, u_tx):
-        """Unfolded data-consistency estimation of the scattering image."""
         m = self.gamma[0] * self._normalize(self._fadj(D_tr, u_tx, ds_fine))
         for k, prox in enumerate(self.prox):
             resid = D_tr - self._forward_m(m, ds_fine, u_tx)
@@ -106,12 +100,6 @@ class ImagingPipeline(nn.Module):
 
     @torch.enable_grad()
     def refine_delta_s(self, D_tr, ds_init, train_idx, steps=25, lr=1e-6):
-        """Per-sample refinement of the slowness estimate by RF data
-        consistency on the *training* angles only (spec 4.5: constrained
-        update branch for the propagation parameters).  The optimization
-        variable is the *coarse* slowness map (well-posed: ~800 unknowns vs
-        ~12k data), initialized from the neural operator (or zeros) and
-        clipped to +-ds_max."""
         g = self.cfg.grid
         f = self.cfg.coarse.factor
         p0 = torch.nn.functional.adaptive_avg_pool2d(
@@ -133,29 +121,16 @@ class ImagingPipeline(nn.Module):
                 p.clamp_(-ds_max, ds_max)
         return self._upsample(p.detach())
 
-    # ----------------------------------------------------------------- forward
     def forward(self, rf, delta_s_true=None, eta_mode="net", train_idx=None,
                 pred_idx=None, return_all=True, refine_steps=0,
                 refine_lr=1e-6):
-        """rf: [B, n_theta, ne, n_t] real.
-        eta_mode: "net" (neural operator) | "truth" (use delta_s_true)
-                  | "zero" (uniform background, ablation).
-        train_idx: angles used for data consistency / m estimation.
-        pred_idx:  extra angles on which d_hat_pred is predicted with the
-                   m and eta estimated from train_idx only (holdout protocol).
-        refine_steps: per-sample data-consistency refinement of delta_s on
-                  the training angles (0 = off, used during training).
-        return_all: also produce full-angle adjoint image and predicted RF
-                    (skipped during training to save time).
-        """
         meta = self.meta
         if train_idx is None:
             train_idx = torch.arange(rf.shape[1], device=rf.device)
 
-        D = rf_to_D(rf, meta)                       # [B, th, n_w, ne]
-        iq = demod_iq(rf, meta)                     # [B, th, ne, n_t_iq]
+        D = rf_to_D(rf, meta)
+        iq = demod_iq(rf, meta)
 
-        # ---- propagation parameter branch (coarse -> fine) -----------------
         ds_coarse = None
         if eta_mode == "truth":
             ds_fine = delta_s_true
@@ -172,13 +147,9 @@ class ImagingPipeline(nn.Module):
                                               train_idx, refine_steps,
                                               refine_lr)
 
-        # ---- transmit fields through the estimated background ---------------
         u_tx = self.born.transmit_fields(ds_fine, train_idx)
         D_tr = D[:, train_idx]
-
-        # ---- unfolded data-consistency estimation of m ----------------------
         m = self._estimate_m(D_tr, ds_fine, u_tx)
-
         d_hat = self._forward_m(m, ds_fine, u_tx)
 
         out = {
@@ -214,14 +185,17 @@ class ImagingPipeline(nn.Module):
 def load_pipeline_checkpoint(pipe, checkpoint):
     """Never silently reinterpret legacy weights with a changed operator."""
     if checkpoint.get("operator_version") != pipe.operator_version:
-        raise ValueError("checkpoint uses an incompatible measurement operator; use a v2 checkpoint or retrain")
+        raise ValueError(
+            "checkpoint uses an incompatible measurement operator; "
+            "oversampled-ASP v3 checkpoints must be retrained")
     if "config" not in checkpoint:
-        raise ValueError("v2 checkpoint must include acquisition config")
+        raise ValueError("v3 checkpoint must include acquisition config")
     from common import _to_C, build_meta
     saved_cfg = _to_C(checkpoint["config"])
     for section, keys in (("grid", ("nx", "nz", "dx", "dz")),
                           ("coarse", ("factor",)),
-                          ("physics", ("c0", "eps_evanescent", "spreading")),
+                          ("physics", ("c0", "eps_evanescent", "spreading",
+                                       "lateral_oversample")),
                           ("model", ("ds_max", "m_rms_ref", "n_unroll"))):
         for key in keys:
             if saved_cfg[section].get(key) != pipe.cfg[section].get(key):
