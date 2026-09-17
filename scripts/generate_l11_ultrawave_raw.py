@@ -23,6 +23,7 @@ sys.path.insert(0, str(PROJECT))
 sys.path.insert(0, "/home/zhuangyang/fmmodel/UltraWave/benchmarks")
 from scripts.generate_l11_kwave_raw import (H5_ROOT, atomic_json, scan_candidates,
                                             truth_maps, medium_builder, sim)
+from data.echogenic_circles import add_echogenic_circles
 import benchmark_calibration as bench
 
 DEFAULT_ROOT = Path("/data/zhuangyang/NumerialBreastPhantoms/l11_ultrawave_500_11angle")
@@ -101,9 +102,11 @@ def fingerprint(case, fit):
     return h.hexdigest()
 
 
-def prepare(root):
+def prepare(root, high_echo_circles=False):
     if (root / "index.json").exists():
         raise FileExistsError(f"manifest already exists: {root / 'index.json'}")
+    if high_echo_circles and root.resolve() == DEFAULT_ROOT.resolve():
+        raise ValueError("high-echo variant requires a new dataset root")
     if shutil.disk_usage(root.parent).free < 35 * 1024**3:
         raise RuntimeError("need at least35GiB free before starting")
     samples, all_selected, stats = [], {}, {}
@@ -129,6 +132,8 @@ def prepare(root):
                                     z_index=int(item["z_index"]), backend="ultrawave",
                                     base_anatomy_id=f"{case}/z{item['z_index']}",
                                     anatomy_repeated=False, scatter_seed=SEED0+len(samples),
+                                    phantom_variant=("high_echo_circles_v1" if high_echo_circles
+                                                     else "oa_breast_original"),
                                     raw_path=f"raw/{sid}.npz", path=f"shards/{sid}.pt",
                                     status="pending", selection=item))
     if counters != dict(train=400, val=50, test=50):
@@ -137,6 +142,8 @@ def prepare(root):
         raise RuntimeError("duplicate anatomy selection")
     case = geometry_case(); fit = absorption_model(case)
     manifest = dict(version=1, backend="ultrawave", simulation="2D linear acoustic full-wave",
+                    phantom_variant=("high_echo_circles_v1" if high_echo_circles
+                                     else "oa_breast_original"),
                     acquisition=dict(angles_deg=ANGLES.tolist(), elements=192, pitch_m=.2e-3,
                                      fs_hz=40e6, band_hz=[4e6,7.5e6], rf_samples=2401,
                                      source_f0_hz=7.5e6, native_dt_s=DT, native_nt=NT),
@@ -241,12 +248,20 @@ def simulate(root, record, refs, pilot=False):
         with np.load(out) as raw:
             if raw["rf"].shape!=(11,192,2401) or not np.isfinite(raw["rf"]).all():
                 raise RuntimeError(f"invalid existing {out}")
+            saved=json.loads(str(raw["metadata_json"].item()))
+            expected=record.get("phantom_variant","oa_breast_original")
+            if saved.get("phantom_variant","oa_breast_original")!=expected:
+                raise RuntimeError(f"{record['id']}: existing RF uses another phantom variant")
         print(f"skip {record['id']}",flush=True); return
     start=time.monotonic()
     with h5py.File(record["h5"],"r") as f:
         plane=np.asarray(f["phan"][record["z_index"]])
     case=geometry_case()
     maps,codes,report,*_=medium_builder.build_medium(plane,case["x"],case["z"],seed=record["scatter_seed"],preset="dual_scale")
+    circles=[]; high_echo_mask=None
+    if record.get("phantom_variant") == "high_echo_circles_v1":
+        maps,high_echo_mask,circles=add_echogenic_circles(
+            maps,codes,case["x"],case["z"],seed=record["scatter_seed"]+404)
     case["maps"]=maps; bench.validate_case(case)
     c,m,truth_meta=truth_maps(maps,case["x"],case["face"])
     fit=absorption_model(case); solver=solver_for(case,maps,fit)
@@ -275,11 +290,16 @@ def simulate(root, record, refs, pilot=False):
                          preset="dual_scale",simulation="2D linear acoustic full-wave",BonA_applied=False,
                          absorption_fit=fit,source_tref_s=trefs,receiver_sampling="pressure after update",
                          elapsed_s=time.monotonic()-start,timings=timings,state_reset_peak_relative_error=repeat_error,
-                         tissue_voxel_report=report,reference_fingerprint=fingerprint(case,fit),**truth_meta))
+                         tissue_voxel_report=report,reference_fingerprint=fingerprint(case,fit),
+                         phantom_variant=record.get("phantom_variant","oa_breast_original"),
+                         high_echo_circles=circles,**truth_meta))
     if pilot:
         show_pilot(root,images,c,codes,case["x"],case["z"])
     tmp=out.with_suffix(".tmp.npz")
-    np.savez_compressed(tmp,rf=rf,c=c,m=m,metadata_json=np.asarray(json.dumps(metadata)))
+    raw_payload=dict(rf=rf,c=c,m=m,metadata_json=np.asarray(json.dumps(metadata)))
+    if high_echo_mask is not None:
+        raw_payload["high_echo_mask"] = high_echo_mask.astype(np.uint8)
+    np.savez_compressed(tmp,**raw_payload)
     os.replace(tmp,out)
     del solver; gc.collect()
     print(f"saved {record['id']} wall={time.monotonic()-start:.1f}s",flush=True)
@@ -287,6 +307,13 @@ def simulate(root, record, refs, pilot=False):
 
 def worker(root,worker_id,workers,only=None):
     configure_gpu(); manifest=json.loads((root/"index.json").read_text())
+    if (manifest.get("phantom_variant") == "high_echo_circles_v1"
+            and root.resolve() == DEFAULT_ROOT.resolve()):
+        raise RuntimeError("refuse circle variant inside the completed original dataset")
+    if any(r.get("phantom_variant","oa_breast_original") !=
+           manifest.get("phantom_variant","oa_breast_original")
+           for r in manifest["samples"]):
+        raise RuntimeError("mixed phantom variants in one manifest")
     with np.load(root/"reference_native.npz") as f:
         if str(f["fingerprint"].item())!=manifest["reference_fingerprint"]:
             raise RuntimeError("reference fingerprint mismatch")
@@ -317,9 +344,13 @@ def status(root):
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--root",type=Path,default=DEFAULT_ROOT)
     ap.add_argument("--mode",required=True,choices=("prepare","reference","pilot","worker","status","gpu-probe"))
+    ap.add_argument("--high-echo-circles",action="store_true",
+                    help="only for prepare: add circles in a separate dataset root")
     ap.add_argument("--sample-id",default="train_000"); ap.add_argument("--worker-id",type=int,default=0); ap.add_argument("--workers",type=int,default=2)
     args=ap.parse_args()
-    if args.mode=="prepare": prepare(args.root)
+    if args.high_echo_circles and args.mode!="prepare":
+        ap.error("--high-echo-circles is only used when preparing a new root")
+    if args.mode=="prepare": prepare(args.root,args.high_echo_circles)
     elif args.mode=="reference": reference(args.root)
     elif args.mode=="pilot": worker(args.root,0,1,args.sample_id)
     elif args.mode=="worker":
