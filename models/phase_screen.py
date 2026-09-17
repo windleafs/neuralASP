@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from common import demod_iq, rf_to_D
 from models.neural_operator import NeuralOperator
-from physics.imaging import BornModel
+from physics.oversampled_imaging import LateralOversampledBornModel
 from physics.phase_screen import (
     controls_to_discrete_ds,
     mean_controls_to_ds,
@@ -64,11 +64,14 @@ class PhaseScreenModel(nn.Module):
 
         padded_meta = copy.deepcopy(meta)
         padded_meta.x0 -= pad * cfg.grid.dx
-        self.born = BornModel(padded_meta, cfg.grid.nx + 2 * pad,
-                              cfg.grid.nz, cfg.grid.dx, cfg.grid.dz,
-                              cfg.physics.c0,
-                              eps=cfg.physics.eps_evanescent,
-                              spreading=cfg.physics.spreading)
+        self.born = LateralOversampledBornModel(
+            padded_meta, cfg.grid.nx + 2 * pad,
+            cfg.grid.nz, cfg.grid.dx, cfg.grid.dz,
+            cfg.physics.c0,
+            eps=cfg.physics.eps_evanescent,
+            spreading=cfg.physics.spreading,
+            lateral_oversample=int(cfg.physics.get("lateral_oversample", 1)),
+        )
 
     def _latent(self, iq, train_idx):
         features = self.backbone.extract_features(iq[:, train_idx], train_idx)
@@ -137,11 +140,7 @@ class PhaseScreenModel(nn.Module):
         """Per-angle complex adjoint images, with no iterative m estimator."""
         born = self.born
         u = born.transmit_fields(ds, idx)
-        b0 = born.scatter(D[:, idx])
-        b0 = born.asp._ifft(born.asp._fft(b0)
-                            * born.surface_transfer.conj())
-        b = born.asp.adjoint(b0, ds, born.omega_)
-        return (b * (u * born.w_z).conj()).sum(dim=2)
+        return born.adjoint_per_angle(D[:, idx], u, ds)
 
     def forward_precomputed(self, iq, D, train_idx):
         phase_raw, mean_raw, bulk_raw = self.predict_components(iq, train_idx)
