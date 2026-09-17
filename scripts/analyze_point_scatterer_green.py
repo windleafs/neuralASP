@@ -1,14 +1,14 @@
 """Compare weak UltraWave point scatterers with the current Born Green model.
 
 The companion generator creates one weak c-only 0.2 mm voxel in an otherwise
-homogeneous medium.  This analyzer constructs the same voxel in the current
+homogeneous medium. This analyzer constructs the same voxel in the current
 BornModel and asks whether the measured angle/frequency/element field pattern
 matches after removing an arbitrary shared per-frequency complex response.
 
 This is intentionally a Green/operator calibration rather than an imaging
-experiment.  If the aligned point response is poor, the mismatch lies in the
+experiment. If the aligned point response is poor, the mismatch lies in the
 Tx/Rx Green model, aperture/element sampling, surface transfer, or acquisition
-convention.  If it is good, complex-phantom mismatch should be sought in the
+convention. If it is good, complex-phantom mismatch should be sought in the
 medium/source discretization instead.
 """
 from __future__ import annotations
@@ -95,14 +95,6 @@ def born_point_data(born: BornModel, md: dict, pad: int, device):
     chi = (C0 / cpad).square() - 1.0
     q = chi[:, None, None] * u0 * born.w_z
     return source_to_data(born, q, zero)
-
-
-def per_frequency_align(pred: torch.Tensor, target: torch.Tensor):
-    eps = torch.finfo(pred.real.dtype).eps
-    num = (target * pred.conj()).sum(dim=(0, 1, 3))
-    den = pred.abs().square().sum(dim=(0, 1, 3)).clamp_min(eps)
-    g = num / den
-    return pred * g[None, None, :, None], g
 
 
 def grouped_curves(pred: torch.Tensor, target: torch.Tensor):
@@ -197,9 +189,14 @@ def analyze_file(path: Path, args, device):
     target = rf_to_D(rf, meta)
     pred = born_point_data(born, md, args.pad, device)
     fit, gain, _ = data_fit_metrics(pred, target)
-    aligned_pred, gain2 = per_frequency_align(pred, target)
-    if not torch.allclose(gain, gain2, rtol=1e-4, atol=1e-6):
-        raise RuntimeError("per-frequency gain implementations disagree")
+
+    # Reuse the exact robust per-frequency gain returned by data_fit_metrics.
+    # That helper applies an energy-relative denominator floor at weak band
+    # edges; recomputing the gain with only machine-epsilon clamping can
+    # legitimately differ there and previously triggered a false assertion.
+    if gain.ndim != 1 or gain.numel() != pred.shape[2]:
+        raise RuntimeError("unexpected per-frequency gain shape")
+    aligned_pred = pred * gain[None, None, :, None]
 
     raw_curves = grouped_curves(pred, target)
     aligned_curves = grouped_curves(aligned_pred, target)
