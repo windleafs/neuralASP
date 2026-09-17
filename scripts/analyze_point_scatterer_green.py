@@ -85,8 +85,10 @@ def source_to_data(born: BornModel, source: torch.Tensor,
 def born_point_data(born: BornModel, md: dict, pad: int, device):
     zero = torch.zeros(1, MODEL_NZ, MODEL_NX + 2 * pad,
                        dtype=torch.float32, device=device)
-    all_idx = torch.arange(len(born.meta.angles_deg), device=device)
-    u0 = born.transmit_fields(zero, all_idx)
+    # All calibration acquisitions use every transmit angle. BornModel does
+    # not retain the original metadata object; calling without angles_idx
+    # correctly uses its internally registered full angle grid.
+    u0 = born.transmit_fields(zero)
 
     c = point_c_map(md, device)
     cpad = torch.nn.functional.pad(c, (pad, pad), value=C0)
