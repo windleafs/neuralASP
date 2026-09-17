@@ -1,0 +1,82 @@
+# ============================================================================
+# Neural angular-spectrum propagation imaging - default configuration
+# All lengths in meters, times in seconds, frequencies in Hz (SI units).
+# ============================================================================
+
+seed: 0
+device: auto            # auto | cpu | cuda
+output_dir: runs/demo
+
+physics:
+  c0: 1540.0            # background reference sound speed [m/s]
+  f0: 2.0e6             # center frequency [Hz]
+  bandwidth: 0.5        # fractional band: f in f0*(1 +- bandwidth/2)
+  fs: 20.0e6            # RF sampling rate [Hz]
+  eps_evanescent: 1.0e-6  # relative regularization inside kz sqrt
+  spreading: farfield2d # depth weight for the 2D Born kernel: none | farfield2d
+
+grid:                   # fine grid (scatterer image m, propagation screens)
+  nx: 128
+  nz: 100
+  dx: 0.3e-3
+  dz: 0.3e-3
+
+coarse:                 # coarse grid for the neural-operator slowness estimate
+  factor: 4             # nsx = nx/factor, nsz = nz/factor
+
+array:
+  n_elements: 64
+  pitch: 0.3e-3         # equals dx -> elements sit on grid nodes
+
+acq:
+  n_angles: 16          # plane-wave transmit angles
+  angle_span_deg: 15.0  # -15 .. +15 degrees
+  n_t: 1024             # RF samples
+  n_freq: 0             # frequencies for the physics layer (0 = full band)
+  holdout_stride: 4     # angles with idx % stride == stride-1 are held out
+
+model:
+  enc_channels: [32, 48, 24]  # shared RF/IQ encoder channels (theta-shared)
+  fno_width: 32
+  fno_modes: [12, 10]
+  fno_layers: 4
+  ds_max: 3.0e-5        # [s/m] bound on |delta_s| via tanh
+  n_unroll: 3           # unfolded scattering-image iterations (1..3)
+  prox_hidden: 16
+  m_rms_ref: 0.2        # normalization scale for scattering images
+
+train:
+  stage: joint          # m | eta | joint
+  n_train: 128
+  n_val: 4
+  n_test: 4
+  batch_size: 4
+  steps: 400
+  lr: 1.5e-3
+  lr_prox: 3.0e-3
+  weight_decay: 0.0
+  grad_clip: 1.0
+  noise_snr_db: 25.0
+  lambda_d: 1.0         # RF data consistency
+  lambda_c: 1.0         # slowness supervision (x0.2 automatically in joint)
+  lambda_I: 0.3         # scattering-image supervision
+  lambda_s: 0.1         # slowness regularizer (TV + range)
+  force_uniform: false  # ablation: force delta_s = 0 (no heterogeneity)
+
+eval:
+  refine_steps: 0       # per-sample delta_s refinement on train angles
+  refine_lr: 1.0e-6     # (kept off by default: at v1 scale it overfits the
+                        #  eta-m crosstalk; see README limitations)
+
+synth:
+  c_perturb_percent: 4.0   # +/- background sound-speed perturbation
+  c_corr_len_mm: 10.0      # correlation length of the smooth perturbation
+  n_points: 8              # point scatterers
+  n_extended: 1            # extended scatterers (disc)
+  point_sigma_mm: 0.6      # Gaussian radius of point scatterers
+
+fullwave:                # independent 2-way full-wave Helmholtz test set
+  oversample: 2          # fw grid = fine grid / oversample
+  pml_cells: 12
+  scatter_contrast_percent: 2.0
+  n_test: 2

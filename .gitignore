@@ -1,0 +1,51 @@
+# Python bytecode, test and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments and credentials
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Generated datasets, model weights and experiment outputs
+/data_cache/
+/runs/
+/backups/
+/data/raw/
+/data/shards/
+/datasets/
+/checkpoints/
+/outputs/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.zarr/
+
+# Logs, scratch files and editor state
+*.log
+*.bak
+*.bak.*
+*.tmp
+*.tmp.*
+*.swp
+*.swo
+/tmp.sh
+.DS_Store
+.idea/
+.vscode/

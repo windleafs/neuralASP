@@ -1,0 +1,71 @@
+seed: 20260915
+device: auto
+output_dir: runs/l11_ultrawave_500_11angle
+
+data:
+  source: l11_fullwave
+  root: /data/zhuangyang/NumerialBreastPhantoms/l11_ultrawave_500_11angle
+  required_backend: ultrawave
+  rf_rms_ref: 5.0e-7
+
+physics:
+  c0: 1540.0
+  f0: 5.75e6
+  bandwidth: 0.6086956521739131
+  fs: 40.0e6
+  eps_evanescent: 1.0e-6
+  spreading: farfield2d
+
+grid:
+  nx: 192
+  nz: 216
+  dx: 0.2e-3
+  dz: 0.2e-3
+
+coarse:
+  factor: 4
+
+array:
+  n_elements: 192
+  pitch: 0.2e-3
+
+acq:
+  n_angles: 11
+  angle_span_deg: 8.0
+  n_t: 2401
+  n_freq: 64
+  holdout_stride: 3
+
+model:
+  enc_channels: [32, 48, 24]
+  fno_width: 32
+  fno_modes: [12, 10]
+  fno_layers: 4
+  ds_max: 5.0e-5
+  n_unroll: 3
+  prox_hidden: 16
+  m_rms_ref: 0.2
+  illum_compensate: false
+
+train:
+  stage: joint
+  n_train: 400
+  n_val: 50
+  n_test: 50
+  batch_size: 1
+  steps: 400
+  lr: 1.5e-3
+  lr_prox: 3.0e-3
+  weight_decay: 0.0
+  grad_clip: 1.0
+  noise_snr_db: 25.0
+  lambda_d: 1.0
+  lambda_c: 1.0
+  lambda_I: 0.3
+  lambda_s: 0.1
+  force_uniform: false
+
+eval:
+  batch_size: 1
+  refine_steps: 0
+  refine_lr: 1.0e-6

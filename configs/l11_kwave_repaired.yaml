@@ -1,0 +1,70 @@
+seed: 20260915
+device: auto
+output_dir: runs/l11_kwave_repaired
+data:
+  source: l11_kwave
+  root: /data/zhuangyang/NumerialBreastPhantoms/l11_neural_asp_64
+  rf_rms_ref: 5.0e-7
+  recompute_D: true
+physics:
+  c0: 1540.0
+  f0: 5.75e6
+  bandwidth: 0.6086956521739131
+  fs: 40.0e6
+  eps_evanescent: 1.0e-6
+  spreading: farfield2d
+  response_mode: calibrated
+  response_path: data_cache/l11_kwave_response_v2.npz
+grid:
+  nx: 192
+  nz: 216
+  dx: 0.2e-3
+  dz: 0.2e-3
+  x0: -0.019125
+  z0: 0.000075
+coarse: {factor: 4}
+array: {n_elements: 192, pitch: 0.2e-3, center_x: 0.0}
+acq:
+  n_angles: 3
+  angle_span_deg: 8.0
+  n_t: 2401
+  n_freq: 0
+  holdout_stride: 3
+  t_ref_s: [2.2594412738120675e-6, 5.333333333333333e-7, 2.2594412738120675e-6]
+model:
+  normalize_iq: true
+  enc_channels: [32, 48, 24]
+  fno_width: 32
+  fno_modes: [12, 10]
+  fno_layers: 4
+  ds_max: 5.0e-5
+  n_unroll: 3
+  prox_hidden: 16
+  m_rms_ref: 0.2
+  illum_compensate: false
+train:
+  stage: all
+  n_train: 48
+  n_val: 8
+  n_test: 8
+  batch_size: 1
+  steps: 400
+  lr: 0.001
+  lr_prox: 0.001
+  weight_decay: 0.0
+  grad_clip: 1.0
+  noise_snr_db: 25.0
+  lambda_d: 1.0
+  lambda_c: 1.0
+  lambda_I: 0.0
+  lambda_s: 0.005
+  joint_c_weight: 1.0
+  joint_d_weight: 0.05
+  joint_lr_scale: 0.1
+  eta_supervision_only: true
+  freeze_stages: true
+  # The crop is offset 0.025 mm from array centre: avoid assuming exact flip symmetry.
+  lateral_flip: false
+  val_every: 100
+  force_uniform: false
+eval: {batch_size: 1, refine_steps: 0, refine_lr: 1.0e-6}
