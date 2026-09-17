@@ -1,7 +1,10 @@
-"""Small self-supervised trial of RF -> multilayer phase-screen prediction.
+"""Train RF -> low-dimensional multilayer phase-screen prediction.
 
-The objective uses only eight input transmit angles. Validation uses three
-held-out angles; no sound-speed or scatterer labels enter optimization.
+V2 uses true discrete phase screens, an angle-set invariant RF operator and a
+low-dimensional default target (4 layers x 24 controls).  Supervised teacher
+training can randomly drop input angles so one model can be evaluated with
+3/5/7/8-angle subsets.  Held-out acquisition angles remain reserved for
+validation of propagation/image consistency.
 """
 from __future__ import annotations
 
@@ -12,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from common import corr2d, demod_iq, rf_to_D, to_plain
 from models.phase_screen import PhaseScreenModel, coherence, heldout_agreement
@@ -61,13 +65,15 @@ def build_cache(ids, model, meta, train_idx, hold_idx, device, top_frac,
             teacher_raw, teacher_bulk, _ = projected_truth_screen(
                 known_ds, model.layers, model.controls, model.born.dz,
                 model.limit_us, model.pad, model.born.z0,
-                model.bulk_limit_us, True)
+                model.bulk_limit_us, model.fit_bulk)
             teacher_tau = model.limit_us * torch.tanh(teacher_raw)
-            teacher_bulk_us = model.bulk_limit_us * torch.tanh(teacher_bulk)
+            teacher_bulk_us = (model.bulk_limit_us * torch.tanh(teacher_bulk)
+                               if teacher_bulk is not None else None)
         cache.append({"id": sample_id, "iq": iq, "D": D, "ref": ref,
                       "truth_abs": truth_abs,
                       "teacher_tau": teacher_tau[None],
-                      "teacher_bulk_us": teacher_bulk_us[None],
+                      "teacher_bulk_us": (teacher_bulk_us[None]
+                                          if teacher_bulk_us is not None else None),
                       "uniform_image11": uniform_image11})
         if sample_number == 1 or sample_number % 20 == 0 or sample_number == len(ids):
             print(json.dumps({"event": "cached", "sample": sample_id,
@@ -75,21 +81,57 @@ def build_cache(ids, model, meta, train_idx, hold_idx, device, top_frac,
     return cache
 
 
-def regularizer(out, limit_us):
-    curve = out["phase_controls_us"]
-    reg = (curve.square().mean() / limit_us**2
-           + 0.1 * (curve[:, :, 1:] - curve[:, :, :-1]).square().mean() / limit_us**2
-           + 0.1 * (curve[:, 1:] - curve[:, :-1]).square().mean() / limit_us**2)
-    reg = reg + 0.1 * torch.tanh(out["raw_bulk"]).square().mean()
+def screen_regularizer(phase_controls_us, limit_us):
+    """Weak magnitude prior plus lateral curvature, not first-order TV.
+
+    A linear lateral delay ramp can be physically meaningful, so penalizing the
+    second derivative is less biased than forcing adjacent controls to match.
+    """
+    x = phase_controls_us / limit_us
+    magnitude = x.square().mean()
+    if x.shape[-1] >= 3:
+        d2x = x[..., 2:] - 2.0 * x[..., 1:-1] + x[..., :-2]
+        curvature = d2x.square().mean()
+    else:
+        curvature = x.new_zeros(())
+    return 0.05 * magnitude + 0.1 * curvature
+
+
+def regularizer(out, model):
+    reg = screen_regularizer(out["phase_controls_us"], model.limit_us)
+    if model.fit_bulk:
+        reg = reg + 0.1 * torch.tanh(out["raw_bulk"]).square().mean()
     return reg
 
 
 def teacher_loss(phase_controls_us, bulk_coeff_us, item, model):
-    phase = ((phase_controls_us - item["teacher_tau"]) /
-             model.limit_us).square().mean()
-    bulk = ((bulk_coeff_us - item["teacher_bulk_us"]) /
-            model.bulk_limit_us).square().mean()
-    return phase + bulk
+    """Robust supervised loss on physical integrated-delay controls."""
+    phase = F.smooth_l1_loss(
+        phase_controls_us / model.limit_us,
+        item["teacher_tau"] / model.limit_us,
+        beta=0.1,
+    )
+    if model.fit_bulk:
+        if item["teacher_bulk_us"] is None:
+            raise ValueError("bulk teacher target missing for fit_bulk=True")
+        bulk = F.smooth_l1_loss(
+            bulk_coeff_us / model.bulk_limit_us,
+            item["teacher_bulk_us"] / model.bulk_limit_us,
+            beta=0.1,
+        )
+        phase = phase + bulk
+    return phase
+
+
+def random_context(train_idx, min_angles: int):
+    """Random non-empty subset for angle-count/domain randomization."""
+    n_total = len(train_idx)
+    if not (1 <= min_angles <= n_total):
+        raise ValueError("min_context_angles must be within available train angles")
+    n = int(torch.randint(min_angles, n_total + 1, (),
+                          device=train_idx.device).item())
+    perm = torch.randperm(n_total, device=train_idx.device)
+    return train_idx[perm[:n]]
 
 
 @torch.no_grad()
@@ -116,7 +158,8 @@ def validate(model, cache, train_idx, hold_idx):
             "uniform_image11": item["uniform_image11"],
             "image11": float(corr2d(image11.abs(), item["truth_abs"]).item()),
             "max_control_us": float(out["phase_controls_us"].abs().max()),
-            "bulk_us": out["bulk_coeff_us"][0].tolist(),
+            "bulk_us": (out["bulk_coeff_us"][0].tolist()
+                        if model.fit_bulk else None),
             "teacher_loss": float(teacher_loss(out["phase_controls_us"],
                                                 out["bulk_coeff_us"], item,
                                                 model).item()),
@@ -147,6 +190,10 @@ def main():
     p.add_argument("--val-every", type=int, default=20)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--reg", type=float, default=0.01)
+    p.add_argument("--layers", type=int, default=4)
+    p.add_argument("--controls", type=int, default=24)
+    p.add_argument("--min-context-angles", type=int, default=3)
+    p.add_argument("--fit-bulk", action="store_true")
     p.add_argument("--objective", choices=("teacher", "coherence", "hybrid"),
                    default="teacher")
     p.add_argument("--teacher-weight", type=float, default=1.0)
@@ -165,13 +212,18 @@ def main():
                        map_location="cpu", weights_only=False)
     cfg, meta = corrected_config(args.config, first, args.n_freq)
     cfg.model.normalize_iq = True
-    model = PhaseScreenModel(cfg, meta).to(device)
+    model = PhaseScreenModel(cfg, meta, layers=args.layers,
+                             controls=args.controls, fit_bulk=args.fit_bulk).to(device)
     train_idx = torch.as_tensor(meta.train_idx, device=device)
     hold_idx = torch.as_tensor(meta.hold_idx, device=device)
+    if not (1 <= args.min_context_angles <= len(train_idx)):
+        p.error("--min-context-angles must not exceed available training angles")
     train_ids = sample_ids("train", args.train_per_case)
     val_ids = sample_ids("val", args.val_per_case)
     print(json.dumps({"event": "setup", "train_samples": train_ids,
-                      "val_samples": val_ids, "n_freq": len(meta.freqs)}), flush=True)
+                      "val_samples": val_ids, "n_freq": len(meta.freqs),
+                      "layers": args.layers, "controls": args.controls,
+                      "fit_bulk": args.fit_bulk}), flush=True)
     train_cache = build_cache(train_ids, model, meta, train_idx, hold_idx,
                               device, args.top_frac,
                               need_reference=args.objective != "teacher")
@@ -208,20 +260,25 @@ def main():
         model.train()
         item = train_cache[torch.randint(len(train_cache), ()).item()]
         if args.objective == "teacher":
-            raw, bulk_raw = model.predict_controls(item["iq"], train_idx)
+            ctx_idx = random_context(train_idx, args.min_context_angles)
+            raw, bulk_raw = model.predict_controls(item["iq"], ctx_idx)
             phase = model.limit_us * torch.tanh(raw)
             bulk = model.bulk_limit_us * torch.tanh(bulk_raw)
             sup = teacher_loss(phase, bulk, item, model)
             coh = None
-            reg = (phase.square().mean() / model.limit_us**2
-                   + 0.1 * torch.tanh(bulk_raw).square().mean())
+            reg = screen_regularizer(phase, model.limit_us)
+            if model.fit_bulk:
+                reg = reg + 0.1 * torch.tanh(bulk_raw).square().mean()
             loss = sup + args.reg * reg
         else:
+            # Coherence reference scales are built for the fixed train_idx set.
+            # Angle dropout is therefore applied to supervised teacher training;
+            # self-supervised objectives keep the fixed context set.
             out = model.forward_precomputed(item["iq"], item["D"], train_idx)
             ref = item["ref"]
             coh = coherence(out["images_input"], ref["mask"],
                             ref["train_scales"]).mean()
-            reg = regularizer(out, model.limit_us)
+            reg = regularizer(out, model)
             sup = teacher_loss(out["phase_controls_us"],
                                out["bulk_coeff_us"], item, model)
             loss = -coh + args.reg * reg
