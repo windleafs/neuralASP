@@ -63,6 +63,8 @@ from scripts.generate_l11_ultrawave_raw import geometry_case, medium_builder  # 
 from scripts.oracle_phase_screen_decomposition import sample_ids  # noqa: E402
 from scripts.pilot_phase_asp import DATA_ROOT, corrected_config, embed, padded_meta  # noqa: E402
 
+RHO0 = 1000.0
+
 
 def central_diff(x: torch.Tensor, spacing: float, dim: int) -> torch.Tensor:
     out = torch.zeros_like(x)
@@ -233,7 +235,7 @@ def evaluate_one(sid: str, args, device):
     c = torch.from_numpy(c_np).to(device)[None]
     rho = torch.from_numpy(rho_np).to(device)[None]
     c_pad = torch.nn.functional.pad(c, (args.pad, args.pad), value=float(cfg.physics.c0))
-    rho0 = float(np.median(rho_np[:4]))
+    rho0 = RHO0
     rho_pad = torch.nn.functional.pad(rho, (args.pad, args.pad), value=rho0)
 
     pmeta = padded_meta(meta, args.pad, cfg.grid.dx)
