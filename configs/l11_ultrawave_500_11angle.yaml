@@ -15,6 +15,9 @@ physics:
   fs: 40.0e6
   eps_evanescent: 1.0e-6
   spreading: farfield2d
+  # Network / parameter maps stay on grid.dx=0.2 mm.  Tx/Rx ASP propagation
+  # is internally oversampled laterally by 2x -> dx_prop=0.1 mm.
+  lateral_oversample: 2
 
 grid:
   nx: 192
