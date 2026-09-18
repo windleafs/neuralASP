@@ -76,6 +76,12 @@ def load_prediction_model(checkpoint: Path, first_sample: dict, device):
     cfg, meta = corrected_config(
         saved_args["config"], first_sample, saved_args["n_freq"])
     cfg.model.normalize_iq = True
+    # Gate presence is part of the learned state, so infer it from the
+    # checkpoint state_dict rather than relying on a particular trainer's CLI
+    # argument naming.  This keeps legacy checkpoints (no gate parameter) and
+    # cross-angle checkpoints (screen_gate_logit present) both loadable.
+    state = ckpt["model"]
+    has_screen_gate = "screen_gate_logit" in state
     model = PhaseScreenModel(
         cfg,
         meta,
@@ -87,10 +93,10 @@ def load_prediction_model(checkpoint: Path, first_sample: dict, device):
         mean_limit_us=float(saved_args.get("mean_limit_us", 2.0)),
         bulk_limit_us=float(saved_args.get("bulk_limit_us", 2.0)),
         fit_bulk=bool(saved_args.get("fit_bulk", False)),
-        screen_gate=bool(saved_args.get("screen_gate", False)),
+        screen_gate=has_screen_gate,
         screen_gate_init=float(saved_args.get("screen_gate_init", 0.02)),
     ).to(device)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(state, strict=True)
     model.eval()
     return ckpt, saved_args, cfg, meta, model
 
