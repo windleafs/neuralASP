@@ -294,6 +294,10 @@ def optimize_one(sample_id, model, meta, cfg, train_idx, hold_idx,
             raise RuntimeError(
                 f"nonfinite oracle loss for {sample_id} at step {step}")
 
+        # Snapshot the controls that produced the current metrics before
+        # Adam mutates them, so best_hold and best_raw always correspond.
+        candidate_raw = raw_amp.detach().clone()
+
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_([raw_amp], args.grad_clip)
@@ -324,7 +328,7 @@ def optimize_one(sample_id, model, meta, cfg, train_idx, hold_idx,
                 best_hold = current_hold
                 best_step = step
                 best_amp_cons = current_amp
-                best_raw = raw_amp.detach().clone()
+                best_raw = candidate_raw
 
     with torch.no_grad():
         best_rate = make_amplitude_rate(
