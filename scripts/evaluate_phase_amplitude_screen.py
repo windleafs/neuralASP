@@ -27,6 +27,7 @@ from common import demod_iq, rf_to_D
 from models.phase_amplitude_screen import PhaseAmplitudeScreenModel
 from models.phase_screen import heldout_agreement
 from physics.amplitude_screen import amplitude_control_curves_np
+from physics.amplitude_consistency import amplitude_pattern_consistency
 from physics.phase_screen import phase_control_curves_us
 from scripts.pilot_phase_asp import DATA_ROOT, corrected_config
 
@@ -132,7 +133,7 @@ def physical_crop(x, pad):
 
 @torch.no_grad()
 def evaluate_one(sample_id, model, meta, cfg, train_idx, hold_idx,
-                 db_range, dpi, out):
+                 db_range, dpi, out, amp_smooth, amp_eps):
     sample = torch.load(
         DATA_ROOT / "shards" / f"{sample_id}.pt",
         map_location="cpu", weights_only=False)
@@ -168,12 +169,16 @@ def evaluate_one(sample_id, model, meta, cfg, train_idx, hold_idx,
         hold = heldout_agreement(
             tr, ho, ref["mask"],
             ref["train_scales"], ref["hold_scales"])
+        amp_consistency = amplitude_pattern_consistency(
+            tr, ho, ref["mask"],
+            smooth_kernel=amp_smooth, eps=amp_eps)
         imgs = model.angle_images(
             ds, D, all_idx, amplitude_rate=amp)
         comp = physical_crop(imgs.mean(dim=1)[0], model.pad)
         all_images[name] = comp.detach().cpu().numpy()
         rows[name] = {
             "holdout_agreement": float(hold[0]),
+            "amplitude_pattern_consistency": float(amp_consistency),
         }
 
     # Shared fixed TGC and shared display reference from all methods.
@@ -205,7 +210,8 @@ def evaluate_one(sample_id, model, meta, cfg, train_idx, hold_idx,
             db, cmap="gray", vmin=-db_range, vmax=0,
             extent=extent, aspect="auto")
         ax.set_title(
-            f"{title}\nhold={rows[key]['holdout_agreement']:.4f}")
+            f"{title}\nhold={rows[key]['holdout_agreement']:.4f} | "
+            f"amp={rows[key]['amplitude_pattern_consistency']:.4f}")
         ax.set_xlabel("Lateral x [mm]")
         ax.set_ylabel("Depth z [mm]")
     fig.colorbar(im, ax=axes, shrink=0.78, label="Amplitude [dB], shared TGC")
@@ -274,6 +280,9 @@ def evaluate_one(sample_id, model, meta, cfg, train_idx, hold_idx,
         "delta_full_vs_uniform": (
             rows["full"]["holdout_agreement"]
             - rows["uniform"]["holdout_agreement"]),
+        "delta_amplitude_consistency_vs_phase": (
+            rows["phase_only"]["amplitude_pattern_consistency"]
+            - rows["full"]["amplitude_pattern_consistency"]),
         "figures": {
             "ablation": bmode_name,
             "parameters": param_name,
@@ -301,6 +310,21 @@ def aggregate(rows):
         r["methods"]["full"]["holdout_agreement"]
         > r["methods"]["uniform"]["holdout_agreement"]
         for r in rows)
+    out["phase_only_amplitude_consistency"] = float(np.mean([
+        r["methods"]["phase_only"]["amplitude_pattern_consistency"]
+        for r in rows
+    ]))
+    out["full_amplitude_consistency"] = float(np.mean([
+        r["methods"]["full"]["amplitude_pattern_consistency"]
+        for r in rows
+    ]))
+    out["delta_amplitude_consistency_vs_phase"] = (
+        out["phase_only_amplitude_consistency"]
+        - out["full_amplitude_consistency"])
+    out["full_amplitude_consistency_wins_vs_phase"] = sum(
+        r["methods"]["full"]["amplitude_pattern_consistency"]
+        < r["methods"]["phase_only"]["amplitude_pattern_consistency"]
+        for r in rows)
     return out
 
 
@@ -312,8 +336,16 @@ def main():
     p.add_argument("--imaging-n-freq", type=int, default=0)
     p.add_argument("--db-range", type=float, default=60.0)
     p.add_argument("--dpi", type=int, default=160)
+    p.add_argument("--amplitude-consistency-smooth", type=int, default=9)
+    p.add_argument("--amplitude-consistency-eps", type=float, default=1e-4)
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
+
+    if (args.amplitude_consistency_smooth < 1
+            or args.amplitude_consistency_smooth % 2 == 0):
+        p.error("--amplitude-consistency-smooth must be a positive odd integer")
+    if args.amplitude_consistency_eps <= 0:
+        p.error("--amplitude-consistency-eps must be positive")
 
     args.out.mkdir(parents=True, exist_ok=True)
     torch.cuda.set_device(args.gpu)
@@ -333,7 +365,9 @@ def main():
         row = evaluate_one(
             sid, model, meta, cfg,
             train_idx, hold_idx,
-            args.db_range, args.dpi, args.out)
+            args.db_range, args.dpi, args.out,
+            args.amplitude_consistency_smooth,
+            args.amplitude_consistency_eps)
         rows.append(row)
         print(json.dumps({
             "event": "phase_amplitude_eval",
@@ -342,6 +376,8 @@ def main():
             "amplitude_gate": row["amplitude_gate"],
             "delta_full_vs_phase": row["delta_full_vs_phase"],
             "delta_full_vs_uniform": row["delta_full_vs_uniform"],
+            "delta_amplitude_consistency_vs_phase":
+                row["delta_amplitude_consistency_vs_phase"],
         }), flush=True)
         torch.cuda.empty_cache()
 
@@ -356,6 +392,10 @@ def main():
                 int(cfg.physics.get("lateral_oversample", 1))),
             "amplitude_freq_power": model.amplitude_freq_power,
             "amplitude_f0_hz": model.amplitude_f0_hz,
+            "amplitude_consistency_smooth":
+                args.amplitude_consistency_smooth,
+            "amplitude_consistency_eps":
+                args.amplitude_consistency_eps,
         },
         "aggregate": aggregate(rows),
         "rows": rows,
