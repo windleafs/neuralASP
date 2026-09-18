@@ -22,6 +22,7 @@ import torch
 from common import to_plain
 from models.phase_amplitude_screen import PhaseAmplitudeScreenModel
 from models.phase_screen import heldout_agreement
+from physics.amplitude_consistency import amplitude_pattern_consistency
 from scripts.pilot_phase_asp import DATA_ROOT, corrected_config
 from train_phase_screen import build_cache, sample_ids
 from train_phase_screen_cross_angle import split_context_target
@@ -63,7 +64,7 @@ def screen_regularizer(effective_phase_us, limit_us):
 
 
 @torch.no_grad()
-def validate(model, cache, train_idx, hold_idx):
+def validate(model, cache, train_idx, hold_idx, amp_smooth, amp_eps):
     model.eval()
     rows = []
     for item in cache:
@@ -77,6 +78,9 @@ def validate(model, cache, train_idx, hold_idx):
         hold = heldout_agreement(
             tr, ho, ref["mask"],
             ref["train_scales"], ref["hold_scales"])
+        amp_cons_full = amplitude_pattern_consistency(
+            tr, ho, ref["mask"],
+            smooth_kernel=amp_smooth, eps=amp_eps)
 
         # Phase-only ablation using the exact same predicted phase/mean.
         zero_amp = torch.zeros_like(out["amplitude_rate"])
@@ -89,6 +93,9 @@ def validate(model, cache, train_idx, hold_idx):
         hold_phase = heldout_agreement(
             tr_phase, ho_phase, ref["mask"],
             ref["train_scales"], ref["hold_scales"])
+        amp_cons_phase = amplitude_pattern_consistency(
+            tr_phase, ho_phase, ref["mask"],
+            smooth_kernel=amp_smooth, eps=amp_eps)
 
         # Amplitude-only residual on top of zero slowness.
         zero_ds = torch.zeros_like(out["effective_ds"])
@@ -101,6 +108,9 @@ def validate(model, cache, train_idx, hold_idx):
         hold_amp = heldout_agreement(
             tr_amp, ho_amp, ref["mask"],
             ref["train_scales"], ref["hold_scales"])
+        amp_cons_amp = amplitude_pattern_consistency(
+            tr_amp, ho_amp, ref["mask"],
+            smooth_kernel=amp_smooth, eps=amp_eps)
 
         rows.append({
             "sample": item["id"],
@@ -108,6 +118,9 @@ def validate(model, cache, train_idx, hold_idx):
             "phase_only_hold": float(hold_phase[0]),
             "amplitude_only_hold": float(hold_amp[0]),
             "full_hold": float(hold[0]),
+            "phase_only_amplitude_consistency": float(amp_cons_phase),
+            "amplitude_only_amplitude_consistency": float(amp_cons_amp),
+            "full_amplitude_consistency": float(amp_cons_full),
             "screen_gate": float(out["screen_gate"]),
             "amplitude_gate": float(out["amplitude_gate"]),
             "max_effective_phase_us": float(
@@ -132,6 +145,19 @@ def validate(model, cache, train_idx, hold_idx):
             mean("full_hold") - mean("phase_only_hold")),
         "delta_full_vs_uniform": (
             mean("full_hold") - mean("uniform_hold")),
+        "mean_phase_only_amplitude_consistency": mean(
+            "phase_only_amplitude_consistency"),
+        "mean_amplitude_only_amplitude_consistency": mean(
+            "amplitude_only_amplitude_consistency"),
+        "mean_full_amplitude_consistency": mean(
+            "full_amplitude_consistency"),
+        "delta_amplitude_consistency_vs_phase": (
+            mean("phase_only_amplitude_consistency")
+            - mean("full_amplitude_consistency")),
+        "full_amplitude_consistency_wins_vs_phase": sum(
+            r["full_amplitude_consistency"]
+            < r["phase_only_amplitude_consistency"]
+            for r in rows),
         "full_hold_wins_vs_phase": sum(
             r["full_hold"] > r["phase_only_hold"] for r in rows),
         "full_hold_wins_vs_uniform": sum(
@@ -205,6 +231,10 @@ def main():
                    default="amplitude")
     p.add_argument("--min-context-angles", type=int, default=3)
     p.add_argument("--target-angles", type=int, default=2)
+    p.add_argument("--phase-agreement-weight", type=float, default=1.0)
+    p.add_argument("--amplitude-consistency-weight", type=float, default=0.25)
+    p.add_argument("--amplitude-consistency-smooth", type=int, default=9)
+    p.add_argument("--amplitude-consistency-eps", type=float, default=1e-4)
     p.add_argument("--amplitude-reg", type=float, default=0.02)
     p.add_argument("--screen-reg", type=float, default=0.01)
     p.add_argument("--amplitude-gate-reg", type=float, default=1e-3)
@@ -222,6 +252,13 @@ def main():
         p.error("amplitude-freq-power must be non-negative")
     if not (0 < args.amplitude_gate_init < 1):
         p.error("amplitude-gate-init must lie in (0,1)")
+    if args.phase_agreement_weight < 0 or args.amplitude_consistency_weight < 0:
+        p.error("objective weights must be non-negative")
+    if (args.amplitude_consistency_smooth < 1
+            or args.amplitude_consistency_smooth % 2 == 0):
+        p.error("amplitude-consistency-smooth must be a positive odd integer")
+    if args.amplitude_consistency_eps <= 0:
+        p.error("amplitude-consistency-eps must be positive")
 
     args.out.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
@@ -278,6 +315,10 @@ def main():
             args.amplitude_layers, args.amplitude_controls],
         "amplitude_limit_np": args.amplitude_limit_np,
         "amplitude_freq_power": args.amplitude_freq_power,
+        "phase_agreement_weight": args.phase_agreement_weight,
+        "amplitude_consistency_weight": args.amplitude_consistency_weight,
+        "amplitude_consistency_smooth": args.amplitude_consistency_smooth,
+        "amplitude_consistency_eps": args.amplitude_consistency_eps,
         "initial_screen_gate": float(model.screen_gate_value().detach()),
         "initial_amplitude_gate": float(model.amplitude_gate_value().detach()),
     }), flush=True)
@@ -296,27 +337,39 @@ def main():
 
     history = []
     best_score = float("-inf")
+    best_amplitude_score = float("-inf")
     started = time.monotonic()
 
     def check(step):
-        nonlocal best_score
-        report = validate(model, val_cache, train_idx, hold_idx)
+        nonlocal best_score, best_amplitude_score
+        report = validate(
+            model, val_cache, train_idx, hold_idx,
+            args.amplitude_consistency_smooth,
+            args.amplitude_consistency_eps)
         report["step"] = int(step)
         report["elapsed_s"] = time.monotonic() - started
         history.append(report)
 
         # Select explicitly by gain over the warm-start phase-only model.
         selection = report["delta_full_vs_phase"]
+        amplitude_selection = report[
+            "delta_amplitude_consistency_vs_phase"]
         improved = selection > best_score
+        amplitude_improved = amplitude_selection > best_amplitude_score
         if improved:
             best_score = float(selection)
+        if amplitude_improved:
+            best_amplitude_score = float(amplitude_selection)
 
         payload = checkpoint_payload(
             model, optimizer, step, cfg, args,
             report, history, best_score)
+        payload["best_amplitude_score"] = float(best_amplitude_score)
         torch.save(payload, args.out / "last.pt")
         if improved:
             torch.save(payload, args.out / "best.pt")
+        if amplitude_improved:
+            torch.save(payload, args.out / "best_amplitude.pt")
         (args.out / "history.json").write_text(
             json.dumps(history, indent=2) + "\n")
 
@@ -326,11 +379,22 @@ def main():
             "selection_delta_full_vs_phase": selection,
             "best_score": best_score,
             "improved": improved,
+            "amplitude_selection_gain": amplitude_selection,
+            "best_amplitude_score": best_amplitude_score,
+            "amplitude_improved": amplitude_improved,
             "mean_uniform_hold": report["mean_uniform_hold"],
             "mean_phase_only_hold": report["mean_phase_only_hold"],
             "mean_full_hold": report["mean_full_hold"],
             "delta_full_vs_phase": report["delta_full_vs_phase"],
             "full_hold_wins_vs_phase": report["full_hold_wins_vs_phase"],
+            "phase_only_amplitude_consistency":
+                report["mean_phase_only_amplitude_consistency"],
+            "full_amplitude_consistency":
+                report["mean_full_amplitude_consistency"],
+            "delta_amplitude_consistency_vs_phase":
+                report["delta_amplitude_consistency_vs_phase"],
+            "full_amplitude_consistency_wins_vs_phase":
+                report["full_amplitude_consistency_wins_vs_phase"],
             "screen_gate": report["screen_gate"],
             "amplitude_gate": report["amplitude_gate"],
         }), flush=True)
@@ -361,6 +425,10 @@ def main():
             ref["train_scales"][:, ctx_pos],
             ref["train_scales"][:, tgt_pos],
         ).mean()
+        amp_consistency = amplitude_pattern_consistency(
+            ctx_img, tgt_img, ref["mask"],
+            smooth_kernel=args.amplitude_consistency_smooth,
+            eps=args.amplitude_consistency_eps)
 
         phase_eff = (
             model.screen_gate_value()
@@ -375,7 +443,8 @@ def main():
             phase_eff, model.limit_us)
 
         loss = (
-            -cross
+            -args.phase_agreement_weight * cross
+            + args.amplitude_consistency_weight * amp_consistency
             + args.amplitude_reg * amp_prior
             + args.screen_reg * phase_prior
             + args.amplitude_gate_reg
@@ -398,6 +467,8 @@ def main():
                 "step": int(step),
                 "sample": item["id"],
                 "cross_angle_agreement": float(cross.detach()),
+                "amplitude_pattern_consistency": float(
+                    amp_consistency.detach()),
                 "screen_gate": float(
                     model.screen_gate_value().detach()),
                 "amplitude_gate": float(
@@ -415,6 +486,8 @@ def main():
         "event": "done",
         "stage": args.stage,
         "best_delta_full_vs_phase": best_score,
+        "best_delta_amplitude_consistency_vs_phase":
+            best_amplitude_score,
         "final_screen_gate": float(
             model.screen_gate_value().detach().cpu()),
         "final_amplitude_gate": float(
