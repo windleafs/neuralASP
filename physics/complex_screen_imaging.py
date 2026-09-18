@@ -15,13 +15,27 @@ class LateralOversampledComplexScreenBornModel(LateralOversampledBornModel):
     amplitude rate are lifted laterally to the internal ASP grid.
     """
 
-    def __init__(self, *args, amplitude_freq_power=1.0, **kwargs):
+    def __init__(self, *args, amplitude_freq_power=1.0,
+                 amplitude_f0_hz=None, **kwargs):
+        # amplitude_f0_hz belongs to this derived complex-screen operator and
+        # must not leak into LateralOversampledBornModel.__init__().
         super().__init__(*args, **kwargs)
         if amplitude_freq_power < 0:
             raise ValueError("amplitude_freq_power must be non-negative")
         self.amplitude_freq_power = float(amplitude_freq_power)
-        self.amplitude_omega_ref = 2.0 * torch.pi * float(
-            torch.as_tensor(self.omega_).mean().item())
+
+        if amplitude_f0_hz is None:
+            amplitude_f0_hz = (
+                float(torch.as_tensor(self.omega_).mean().item())
+                / (2.0 * torch.pi)
+            )
+        if float(amplitude_f0_hz) <= 0:
+            raise ValueError("amplitude_f0_hz must be positive")
+
+        self.amplitude_f0_hz = float(amplitude_f0_hz)
+        self.amplitude_omega_ref = (
+            2.0 * torch.pi * self.amplitude_f0_hz
+        )
 
     def _amp_prop(self, amplitude_rate):
         if amplitude_rate is None:
