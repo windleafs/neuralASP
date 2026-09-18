@@ -31,6 +31,50 @@ from physics.phase_screen import phase_control_curves_us
 from scripts.pilot_phase_asp import DATA_ROOT, corrected_config
 
 
+def load_learned_state_preserve_physics(model, checkpoint_state):
+    """Load learned tensors while keeping the eval-time physics operator.
+
+    Training checkpoints persist frequency-dependent born.* buffers such as
+    source_response. Full-band evaluation can intentionally rebuild the Born/
+    ASP operator with a different number of frequencies, so those buffers must
+    come from the freshly constructed eval model rather than the checkpoint.
+    """
+    current = model.state_dict()
+    copied = []
+    skipped_physics = []
+
+    for key, value in checkpoint_state.items():
+        if key.startswith("born."):
+            skipped_physics.append(key)
+            continue
+        if key not in current:
+            raise RuntimeError(
+                f"checkpoint contains unexpected learned tensor: {key}")
+        if tuple(current[key].shape) != tuple(value.shape):
+            raise RuntimeError(
+                "learned tensor shape mismatch for "
+                f"{key}: checkpoint={tuple(value.shape)} "
+                f"eval={tuple(current[key].shape)}")
+        current[key] = value
+        copied.append(key)
+
+    missing_learned = [
+        key for key in current
+        if not key.startswith("born.") and key not in checkpoint_state
+    ]
+    if missing_learned:
+        raise RuntimeError(
+            "checkpoint is missing learned tensors required by eval model: "
+            + ", ".join(missing_learned[:8]))
+
+    model.load_state_dict(current, strict=True)
+    return {
+        "copied_tensors": len(copied),
+        "skipped_physics_buffers": len(skipped_physics),
+        "skipped_physics_preview": skipped_physics[:8],
+    }
+
+
 def build_model(checkpoint, first_sample, imaging_n_freq, device):
     ckpt = torch.load(
         checkpoint, map_location=device, weights_only=False)
@@ -54,10 +98,20 @@ def build_model(checkpoint, first_sample, imaging_n_freq, device):
         amplitude_gate_init=float(args.get("amplitude_gate_init", 0.02)),
         amplitude_freq_power=float(args.get("amplitude_freq_power", 1.0)),
     ).to(device)
-    model.load_state_dict(ckpt["model"], strict=True)
+
+    load_report = load_learned_state_preserve_physics(
+        model, ckpt["model"])
+    print(json.dumps({
+        "event": "checkpoint_load",
+        "checkpoint": str(checkpoint),
+        "checkpoint_n_freq": int(
+            ckpt.get("args", {}).get("n_freq", -1)),
+        "eval_n_freq": int(len(meta.freqs)),
+        **load_report,
+    }), flush=True)
+
     model.eval()
     return ckpt, args, cfg, meta, model
-
 
 def fixed_tgc(nz, dz):
     z_mm = np.arange(nz) * dz * 1e3
