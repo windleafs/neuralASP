@@ -77,3 +77,34 @@ def test_complex_screen_step_adjoint_identity():
     lhs = torch.vdot(Au, v)
     rhs = torch.vdot(u, AHv)
     assert torch.allclose(lhs, rhs, atol=1e-11, rtol=1e-11)
+
+
+def test_complex_screen_imager_accepts_explicit_amplitude_f0():
+    from types import SimpleNamespace
+    from physics.complex_screen_imaging import (
+        LateralOversampledComplexScreenBornModel,
+    )
+
+    meta = SimpleNamespace(
+        angles_deg=[-1.0, 0.0, 1.0],
+        xe_coords=[-0.0002, 0.0, 0.0002],
+        freqs=[4.5e6, 5.5e6, 6.5e6],
+        f0=5.5e6,
+        x0=-0.0004,
+        z0=0.0,
+        t_ref_s=[0.0, 0.0, 0.0],
+        system_response=[1.0, 1.0, 1.0],
+    )
+    model = LateralOversampledComplexScreenBornModel(
+        meta,
+        nx=4,
+        nz=5,
+        dx=0.2e-3,
+        dz=0.2e-3,
+        c0=1540.0,
+        lateral_oversample=2,
+        amplitude_freq_power=1.0,
+        amplitude_f0_hz=6.0e6,
+    )
+    assert model.amplitude_f0_hz == 6.0e6
+    assert abs(model.amplitude_omega_ref / (2.0 * torch.pi) - 6.0e6) < 1e-6
