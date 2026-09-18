@@ -5,14 +5,19 @@ propagation branch so the model represents
 
     delta_s(z, x) ~= mean_delay_profile(z) + relative_phase_screens(z, x).
 
-The mean branch predicts cumulative delay G(z) controls, while the relative
-branch predicts integrated per-layer delays with a fixed lateral piston gauge.
-A legacy two-coefficient bulk head is kept only for loading/ablating older
-checkpoints when ``mean_controls == 0``.
+V4 optionally gates the relative-screen contribution,
+
+    delta_s_net = delta_s_mean + alpha * delta_s_relative,
+
+with a learnable scalar alpha in [0, 1].  This keeps teacher/physics
+parameterization ungated while allowing the network to start near the empirically
+strong mean-only solution and add relative screens only when imaging loss supports
+them.
 """
 from __future__ import annotations
 
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -31,12 +36,15 @@ from physics.phase_screen import (
 class PhaseScreenModel(nn.Module):
     def __init__(self, cfg, meta, layers=4, controls=24, pad=32,
                  limit_us=0.2, mean_controls=0, mean_limit_us=2.0,
-                 bulk_limit_us=2.0, fit_bulk=False):
+                 bulk_limit_us=2.0, fit_bulk=False,
+                 screen_gate=False, screen_gate_init=0.02):
         super().__init__()
         if mean_controls < 0:
             raise ValueError("mean_controls must be non-negative")
         if mean_controls and fit_bulk:
             raise ValueError("mean profile head and legacy fit_bulk are mutually exclusive")
+        if screen_gate and not (0.0 < screen_gate_init < 1.0):
+            raise ValueError("screen_gate_init must lie strictly inside (0, 1)")
         self.meta = meta
         self.layers = layers
         self.controls = controls
@@ -46,6 +54,8 @@ class PhaseScreenModel(nn.Module):
         self.mean_limit_us = mean_limit_us
         self.bulk_limit_us = bulk_limit_us
         self.fit_bulk = fit_bulk
+        self.screen_gate_enabled = bool(screen_gate)
+        self.screen_gate_init = float(screen_gate_init)
 
         self.backbone = NeuralOperator(cfg, meta, cfg.grid.nx, cfg.grid.nz,
                                        cfg.grid.dx, cfg.grid.dz)
@@ -62,6 +72,12 @@ class PhaseScreenModel(nn.Module):
             nn.init.zeros_(self.bulk_head.weight)
             nn.init.zeros_(self.bulk_head.bias)
 
+        if self.screen_gate_enabled:
+            logit = math.log(screen_gate_init / (1.0 - screen_gate_init))
+            self.screen_gate_logit = nn.Parameter(torch.tensor(float(logit)))
+        else:
+            self.register_parameter("screen_gate_logit", None)
+
         padded_meta = copy.deepcopy(meta)
         padded_meta.x0 -= pad * cfg.grid.dx
         self.born = LateralOversampledBornModel(
@@ -72,6 +88,12 @@ class PhaseScreenModel(nn.Module):
             spreading=cfg.physics.spreading,
             lateral_oversample=int(cfg.physics.get("lateral_oversample", 1)),
         )
+
+    def screen_gate_value(self):
+        """Scalar network screen gate; legacy models return exactly one."""
+        if self.screen_gate_logit is None:
+            return self.phase_head.weight.new_ones(())
+        return torch.sigmoid(self.screen_gate_logit)
 
     def _latent(self, iq, train_idx):
         features = self.backbone.extract_features(iq[:, train_idx], train_idx)
@@ -101,13 +123,14 @@ class PhaseScreenModel(nn.Module):
         phase_raw, mean_raw, bulk_raw = self.predict_components(iq, train_idx)
         return phase_raw, (mean_raw if self.mean_controls else bulk_raw)
 
-    def components_to_slowness(self, phase_raw, mean_raw=None, bulk_raw=None):
-        """Convert low-dimensional propagation controls to the ASP carrier."""
+    def _components_to_slowness_scaled(self, phase_raw, mean_raw=None,
+                                       bulk_raw=None, screen_scale=1.0):
         if phase_raw.shape[-2:] != (self.layers, self.controls):
             raise ValueError("incorrect phase-control shape")
-        ds = controls_to_discrete_ds(
+        ds_rel = controls_to_discrete_ds(
             phase_raw, self.born.nz, self.born.nx, self.born.dz,
             self.limit_us, self.pad)
+        ds = ds_rel * screen_scale
 
         if self.mean_controls:
             if mean_raw is None or mean_raw.shape[-1] != self.mean_controls:
@@ -129,8 +152,20 @@ class PhaseScreenModel(nn.Module):
                             * (1e-6 / self.born.dz))[:, :, None]
         return ds
 
+    def components_to_slowness(self, phase_raw, mean_raw=None, bulk_raw=None):
+        """Ungated physical/teacher parameterization (legacy semantics)."""
+        return self._components_to_slowness_scaled(
+            phase_raw, mean_raw, bulk_raw, screen_scale=1.0)
+
+    def network_components_to_slowness(self, phase_raw, mean_raw=None,
+                                       bulk_raw=None):
+        """Network correction using the optional learnable relative-screen gate."""
+        return self._components_to_slowness_scaled(
+            phase_raw, mean_raw, bulk_raw,
+            screen_scale=self.screen_gate_value())
+
     def screen_to_slowness(self, raw, aux_raw=None):
-        """Backward-compatible two-argument conversion API."""
+        """Backward-compatible ungated two-argument conversion API."""
         if self.mean_controls:
             return self.components_to_slowness(raw, mean_raw=aux_raw)
         return self.components_to_slowness(
@@ -144,9 +179,13 @@ class PhaseScreenModel(nn.Module):
 
     def forward_precomputed(self, iq, D, train_idx):
         phase_raw, mean_raw, bulk_raw = self.predict_components(iq, train_idx)
-        ds = self.components_to_slowness(phase_raw, mean_raw, bulk_raw)
+        ds = self.network_components_to_slowness(
+            phase_raw, mean_raw, bulk_raw)
         images = self.angle_images(ds, D, train_idx)
 
+        phase_controls_us = self.limit_us * torch.tanh(phase_raw)
+        gate = self.screen_gate_value()
+        effective_phase_controls_us = gate * phase_controls_us
         mean_controls_us = (self.mean_limit_us * torch.tanh(mean_raw)
                             if self.mean_controls else mean_raw)
         mean_profile_us = (mean_delay_profile_us(
@@ -158,7 +197,9 @@ class PhaseScreenModel(nn.Module):
                          phase_raw.new_zeros(phase_raw.shape[0], 2))
         return {
             "raw_controls": phase_raw,
-            "phase_controls_us": self.limit_us * torch.tanh(phase_raw),
+            "phase_controls_us": phase_controls_us,
+            "effective_phase_controls_us": effective_phase_controls_us,
+            "screen_gate": gate,
             "raw_mean": mean_raw,
             "mean_controls_us": mean_controls_us,
             "mean_delay_profile_us": mean_profile_us,
