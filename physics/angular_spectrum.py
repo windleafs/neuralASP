@@ -64,17 +64,37 @@ class HeterogeneousAngularSpectrum(nn.Module):
         return torch.exp(1j * kz * (self.dz / 2.0))
 
     def screen(self, ds_col, omega):
-        """Phase screen exp(i omega dS dz) for one slab.
+        """Phase-only screen exp(i omega dS dz) for one slab."""
+        return self.complex_screen(ds_col, None, omega)
 
-        ds_col: [..., nx] real slowness perturbation of the slab (leading
-        dims are the batch dims of delta_s). Returns [..., 1, n_freq, nx],
-        broadcastable against fields [..., n_theta, n_freq, nx].
+    def complex_screen(self, ds_col, amplitude_rate_col, omega,
+                       amplitude_omega_ref=None, amplitude_freq_power=1.0):
+        """Combined phase + log-amplitude propagation screen.
+
+        amplitude_rate_col is an optional signed log-amplitude rate [Np/m].
+        Positive values attenuate and negative values amplify relative to the
+        reference propagation model. The frequency law is
+        (omega / amplitude_omega_ref) ** amplitude_freq_power.
         """
-        L = ds_col.dim() - 1                              # batch dims
-        om = omega.view(*([1] * L), -1, 1)                # [1.., n_w, 1]
-        arg = self.dz * om * ds_col.unsqueeze(-2)         # [..., n_w, nx]
-        scr = torch.exp(1j * arg.to(self.cdtype))
-        if L > 0:                   # batched delta_s: add the theta slot
+        if amplitude_freq_power < 0:
+            raise ValueError("amplitude_freq_power must be non-negative")
+        L = ds_col.dim() - 1
+        om = omega.view(*([1] * L), -1, 1)
+        phase = self.dz * om * ds_col.unsqueeze(-2)
+        exponent = 1j * phase.to(self.cdtype)
+
+        if amplitude_rate_col is not None:
+            if amplitude_rate_col.shape != ds_col.shape:
+                raise ValueError("amplitude_rate_col must match ds_col shape")
+            if amplitude_omega_ref is None or float(amplitude_omega_ref) <= 0:
+                raise ValueError("positive amplitude_omega_ref is required")
+            ratio = (om / float(amplitude_omega_ref)).clamp_min(0.0)
+            law = ratio.pow(float(amplitude_freq_power))
+            log_amp = self.dz * amplitude_rate_col.unsqueeze(-2) * law
+            exponent = exponent - log_amp.to(self.cdtype)
+
+        scr = torch.exp(exponent)
+        if L > 0:
             scr = scr.unsqueeze(-3)
         return scr
 
@@ -97,7 +117,9 @@ class HeterogeneousAngularSpectrum(nn.Module):
         return u
 
     # ----------------------------------------------------------------- marches
-    def forward(self, u0, delta_s, omega_grid, dx=None, dz=None):
+    def forward(self, u0, delta_s, omega_grid, dx=None, dz=None,
+                amplitude_rate=None, amplitude_omega_ref=None,
+                amplitude_freq_power=1.0):
         """March a field stack downward slab by slab.
 
         u0: [..., n_theta, n_freq, nx] complex initial field at z = 0.
@@ -112,12 +134,18 @@ class HeterogeneousAngularSpectrum(nn.Module):
         u = u0
         nz = delta_s.shape[-2]
         for z in range(nz - 1):
-            scr = self.screen(delta_s[..., z, :], omega)
+            amp_col = (None if amplitude_rate is None
+                       else amplitude_rate[..., z, :])
+            scr = self.complex_screen(
+                delta_s[..., z, :], amp_col, omega,
+                amplitude_omega_ref, amplitude_freq_power)
             u = self._step(u, H, scr)
             fields.append(u)
         return torch.stack(fields, dim=-2)
 
-    def march_up(self, q_stack, delta_s, omega_grid, dx=None, dz=None):
+    def march_up(self, q_stack, delta_s, omega_grid, dx=None, dz=None,
+                 amplitude_rate=None, amplitude_omega_ref=None,
+                 amplitude_freq_power=1.0):
         """Evaluate an up-going source distribution at the surface.
 
         q_stack: [..., n_theta, n_freq, nz, nx] complex slab sources.
@@ -130,11 +158,17 @@ class HeterogeneousAngularSpectrum(nn.Module):
         H = self.half_transfer(omega)
         r = q_stack[..., -1, :]
         for z in range(q_stack.shape[-2] - 2, -1, -1):
-            scr = self.screen(delta_s[..., z, :], omega)
+            amp_col = (None if amplitude_rate is None
+                       else amplitude_rate[..., z, :])
+            scr = self.complex_screen(
+                delta_s[..., z, :], amp_col, omega,
+                amplitude_omega_ref, amplitude_freq_power)
             r = self._step(r, H, scr) + q_stack[..., z, :]
         return r
 
-    def adjoint(self, v0, delta_s, omega_grid, dx=None, dz=None):
+    def adjoint(self, v0, delta_s, omega_grid, dx=None, dz=None,
+                amplitude_rate=None, amplitude_omega_ref=None,
+                amplitude_freq_power=1.0):
         """Conjugated back-march (Hermitian adjoint of the continuation).
 
         v0: [..., n_theta, n_freq, nx] complex field at the surface.
@@ -149,7 +183,11 @@ class HeterogeneousAngularSpectrum(nn.Module):
         for z in range(nz):
             out.append(b)
             if z < nz - 1:
-                scr = self.screen(delta_s[..., z, :], omega)
+                amp_col = (None if amplitude_rate is None
+                           else amplitude_rate[..., z, :])
+                scr = self.complex_screen(
+                    delta_s[..., z, :], amp_col, omega,
+                    amplitude_omega_ref, amplitude_freq_power)
                 b = self._step_adj(b, H, scr)
         return torch.stack(out, dim=-2)
 
