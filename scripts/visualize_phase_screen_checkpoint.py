@@ -87,6 +87,8 @@ def load_prediction_model(checkpoint: Path, first_sample: dict, device):
         mean_limit_us=float(saved_args.get("mean_limit_us", 2.0)),
         bulk_limit_us=float(saved_args.get("bulk_limit_us", 2.0)),
         fit_bulk=bool(saved_args.get("fit_bulk", False)),
+        screen_gate=bool(saved_args.get("screen_gate", False)),
+        screen_gate_init=float(saved_args.get("screen_gate_init", 0.02)),
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -390,7 +392,7 @@ def evaluate_one(sample_id, model, pred_cfg, pred_meta,
     pred_train_idx = torch.as_tensor(pred_meta.train_idx, device=device)
     pred_phase_raw, pred_mean_raw, pred_bulk_raw = (
         model.predict_components(iq, pred_train_idx))
-    network_ds = model.components_to_slowness(
+    network_ds = model.network_components_to_slowness(
         pred_phase_raw, pred_mean_raw, pred_bulk_raw)
 
     truth_abs = sample["m"].abs().to(device)
@@ -424,7 +426,7 @@ def evaluate_one(sample_id, model, pred_cfg, pred_meta,
         zero_mean = torch.zeros_like(pred_mean_raw)
         mean_only_ds = model.components_to_slowness(
             zero_phase, pred_mean_raw, pred_bulk_raw)
-        screen_only_ds = model.components_to_slowness(
+        screen_only_ds = model.network_components_to_slowness(
             pred_phase_raw, zero_mean, pred_bulk_raw)
     else:
         mean_only_ds = zero_ds
@@ -484,7 +486,12 @@ def evaluate_one(sample_id, model, pred_cfg, pred_meta,
         },
         "predicted": {
             "phase_controls_us": pred_phase_us,
+            "effective_phase_controls_us": (
+                model.screen_gate_value().detach().cpu().item()
+                * np.asarray(pred_phase_us)
+            ).tolist(),
             "mean_controls_us": pred_mean_us,
+            "screen_gate": float(model.screen_gate_value().detach().cpu()),
         },
         "teacher": {
             "phase_controls_us": teacher_phase_us,
@@ -590,6 +597,8 @@ def main():
             "mean_controls": model.mean_controls,
             "mean_limit_us": model.mean_limit_us,
             "fit_bulk": model.fit_bulk,
+            "screen_gate_enabled": model.screen_gate_enabled,
+            "screen_gate": float(model.screen_gate_value().detach().cpu()),
         },
         "frequency_sampling": {
             "prediction": prediction_info,
