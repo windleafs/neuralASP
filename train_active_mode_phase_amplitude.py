@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from common import demod_iq, rf_to_D, to_plain
 from models.active_mode_phase_amplitude import ActiveModePhaseAmplitudeModel
 from models.phase_screen import heldout_agreement
+from physics.phase_screen import mean_controls_to_ds
 from scripts.pilot_phase_asp import DATA_ROOT, corrected_config
 from train_phase_screen import build_cache, sample_ids
 from train_phase_screen_cross_angle import split_context_target
