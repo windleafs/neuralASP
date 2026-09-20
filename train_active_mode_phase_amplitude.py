@@ -419,6 +419,7 @@ def main():
         "active_rank": args.active_rank,
         "active_basis_source": args.active_basis_source,
         "candidate_dim": model.active_candidate_dim,
+        "active_relative_only": model.active_relative_only,
         "active_depths_mm": model.active_depths_mm,
         "trainable_parameters": int(sum(p.numel() for p in trainable)),
     }), flush=True)
