@@ -27,7 +27,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from common import demod_iq, rf_to_D, to_plain
 from models.active_mode_phase_amplitude import ActiveModePhaseAmplitudeModel
@@ -44,39 +43,6 @@ def plain_args(args):
 def coeff_regularizer(coeff, limit):
     x = coeff / float(limit)
     return x.square().mean()
-
-
-def smooth_log_envelope(image, kernel: int, eps: float):
-    env = image.abs().clamp_min(eps)
-    if kernel > 1:
-        env = F.avg_pool2d(
-            env[:, None], kernel_size=kernel, stride=1,
-            padding=kernel // 2)[:, 0]
-    return torch.log(env.clamp_min(eps))
-
-
-def depth_log_energy(image, bins: int, eps: float):
-    """Depth-binned log mean envelope; preserves absolute common-mode level."""
-    env = image.abs().mean(dim=-1)
-    B, nz = env.shape
-    edges = torch.linspace(0, nz, bins + 1, device=image.device).round().long()
-    rows = []
-    for a, b in zip(edges[:-1], edges[1:]):
-        if int(b) <= int(a):
-            continue
-        rows.append(torch.log(env[:, int(a):int(b)].mean(dim=-1).clamp_min(eps)))
-    return torch.stack(rows, dim=-1)
-
-
-def paired_image_loss(current, reference, smooth_kernel, depth_bins, eps,
-                      depth_weight):
-    cur_log = smooth_log_envelope(current, smooth_kernel, eps)
-    ref_log = smooth_log_envelope(reference, smooth_kernel, eps)
-    image = (cur_log - ref_log).abs().mean()
-    cur_depth = depth_log_energy(current, depth_bins, eps)
-    ref_depth = depth_log_energy(reference, depth_bins, eps)
-    depth = (cur_depth - ref_depth).abs().mean()
-    return image + depth_weight * depth, image, depth
 
 
 def reset_active_phase_branch(model, phase_gate_init):
@@ -250,9 +216,9 @@ def validate_paired_amplitude(model, cache, paired, train_idx,
         current = compound(model, ds, item["D"], train_idx, amp_rate)
         phase_only = compound(model, ds, item["D"], train_idx, zero_amp)
         reference = compound(model, ds, paired[item["id"]]["D"], train_idx, zero_amp)
-        full_loss, _, _ = paired_image_loss(
+        full_loss, _, _, _ = paired_image_loss(
             current, reference, smooth_kernel, depth_bins, eps, depth_weight)
-        phase_loss, _, _ = paired_image_loss(
+        phase_loss, _, _, _ = paired_image_loss(
             phase_only, reference, smooth_kernel, depth_bins, eps, depth_weight)
         rows.append({
             "sample": item["id"],
@@ -456,7 +422,7 @@ def main():
             zero_amp = torch.zeros_like(amp_rate)
             reference = compound(
                 model, ds, paired_train[item["id"]]["D"], train_idx, zero_amp)
-            task, image_loss, depth_loss = paired_image_loss(
+            task, image_loss, depth_loss, _ = paired_image_loss(
                 current, reference, args.smooth_kernel, args.depth_bins,
                 args.eps, args.depth_weight)
             prior = coeff_regularizer(
