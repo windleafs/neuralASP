@@ -5,6 +5,7 @@ from physics.active_subspace import (
     gram_spectrum,
     linearity_diagnostics,
     subspace_overlap,
+    subspace_overlap_curve,
 )
 
 
@@ -38,3 +39,23 @@ def test_below_screen_mask_zeros_shallower_rows():
     out = below_screen_mask(mask, 2)
     assert out[:, :2].sum() == 0
     assert out[:, 2:].sum() == 12
+
+def test_linearity_diagnostics_ignore_near_null_columns():
+    ref = torch.zeros(10, 3)
+    test = torch.zeros(10, 3)
+    ref[:, 0] = torch.arange(10, dtype=torch.float32)
+    test[:, 0] = ref[:, 0]
+    # Column 1 is exactly null, column 2 is tiny relative to column 0.
+    ref[:, 2] = 1e-10
+    test[:, 2] = 2e-10
+    d = linearity_diagnostics(ref, test, active_rel_threshold=1e-6)
+    assert d["valid"].tolist() == [True, False, False]
+    torch.testing.assert_close(d["cosine"][0], torch.tensor(1.0), atol=1e-6, rtol=1e-6)
+
+
+def test_subspace_overlap_curve_identical_is_one():
+    Q, _ = torch.linalg.qr(torch.randn(9, 5))
+    Vh = Q.T
+    ranks, values = subspace_overlap_curve(Vh, Vh, 5)
+    assert ranks == [1, 2, 3, 4, 5]
+    torch.testing.assert_close(values, torch.ones(5), atol=1e-6, rtol=1e-6)
