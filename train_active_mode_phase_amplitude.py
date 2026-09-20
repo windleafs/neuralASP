@@ -6,6 +6,11 @@ phase:
     Train mean-delay + K phase active coefficients with cross-angle agreement.
     Amplitude is fixed to zero.
 
+relative-phase:
+    Freeze the warm-started backbone + mean-delay branch, reset the active
+    phase head/gate, and train only K relative-active coefficients.  This is
+    the clean test of residual phase aberration beyond mean delay.
+
 paired-amplitude:
     Freeze the phase predictor and train only K amplitude coefficients using
     paired simulation data from the same phantom with attenuation removed.
@@ -75,6 +80,60 @@ def paired_image_loss(current, reference, smooth_kernel, depth_bins, eps,
     return image + depth_weight * depth, image, depth
 
 
+def reset_active_phase_branch(model, phase_gate_init):
+    torch.nn.init.zeros_(model.phase_head.weight)
+    torch.nn.init.zeros_(model.phase_head.bias)
+    logit = np.log(phase_gate_init / (1.0 - phase_gate_init))
+    with torch.no_grad():
+        model.phase_gate_logit.fill_(float(logit))
+
+
+def warm_start_v6(model, checkpoint_path, device, *, reset_active_phase=False,
+                  phase_gate_init=0.02):
+    """Warm start learned predictor while preserving current fixed basis buffers.
+
+    Active templates are always kept from the newly constructed model.  When
+    reset_active_phase is true, the old coefficient head/gate are also skipped
+    because they belong to a different active basis.
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    current = model.state_dict()
+    copied, skipped = [], []
+    basis_buffers = {
+        "phase_active_templates",
+        "amplitude_active_templates",
+    }
+    for key, value in ckpt["model"].items():
+        if key.startswith("born.") or key in basis_buffers:
+            skipped.append((key, "physics/basis buffer"))
+            continue
+        if reset_active_phase and (
+            key.startswith("phase_head.") or key == "phase_gate_logit"):
+            skipped.append((key, "reset for new relative basis"))
+            continue
+        if key not in current:
+            skipped.append((key, "missing in current model"))
+            continue
+        if tuple(current[key].shape) != tuple(value.shape):
+            skipped.append((key, f"shape {tuple(value.shape)} -> {tuple(current[key].shape)}"))
+            continue
+        current[key] = value
+        copied.append(key)
+    model.load_state_dict(current, strict=True)
+    if reset_active_phase:
+        reset_active_phase_branch(model, phase_gate_init)
+    print(json.dumps({
+        "event": "warm_start_v6",
+        "checkpoint": str(checkpoint_path),
+        "source_step": int(ckpt.get("step", -1)),
+        "copied_tensors": len(copied),
+        "skipped_tensors": len(skipped),
+        "reset_active_phase": bool(reset_active_phase),
+        "skipped_preview": skipped[:10],
+    }), flush=True)
+    return ckpt
+
+
 def set_stage_trainable(model, stage):
     for p in model.parameters():
         p.requires_grad_(False)
@@ -85,6 +144,10 @@ def set_stage_trainable(model, stage):
         if model.mean_head is not None:
             for p in model.mean_head.parameters():
                 p.requires_grad_(True)
+        for p in model.phase_head.parameters():
+            p.requires_grad_(True)
+        model.phase_gate_logit.requires_grad_(True)
+    elif stage == "relative-phase":
         for p in model.phase_head.parameters():
             p.requires_grad_(True)
         model.phase_gate_logit.requires_grad_(True)
@@ -202,7 +265,7 @@ def main():
     p.add_argument("--active-rank", type=int, default=6)
     p.add_argument("--active-basis-source", choices=("balanced", "phase", "amplitude"),
                    default="balanced")
-    p.add_argument("--stage", choices=("phase", "paired-amplitude"), default="phase")
+    p.add_argument("--stage", choices=("phase", "relative-phase", "paired-amplitude"), default="phase")
     p.add_argument("--init-checkpoint", type=Path, required=True)
     p.add_argument("--paired-reference-root", type=Path)
     p.add_argument("--out", type=Path, required=True)
@@ -261,7 +324,10 @@ def main():
         amplitude_gate_init=args.amplitude_gate_init,
         amplitude_freq_power=args.amplitude_freq_power,
     ).to(device)
-    _warm_start_learned_weights(model, args.init_checkpoint, device)
+    warm_start_v6(
+        model, args.init_checkpoint, device,
+        reset_active_phase=(args.stage == "relative-phase"),
+        phase_gate_init=args.phase_gate_init)
     set_stage_trainable(model, args.stage)
 
     train_idx = torch.as_tensor(meta.train_idx, device=device)
@@ -290,7 +356,7 @@ def main():
 
     def check(step):
         nonlocal best_score
-        if args.stage == "phase":
+        if args.stage in ("phase", "relative-phase"):
             report = validate_phase(model, val_cache, train_idx, hold_idx)
             score = report["delta_phase_vs_uniform"]
         else:
@@ -332,7 +398,7 @@ def main():
         model.train()
         item = train_cache[torch.randint(len(train_cache), ()).item()]
 
-        if args.stage == "phase":
+        if args.stage in ("phase", "relative-phase"):
             ctx_pos, tgt_pos, ctx_idx, tgt_idx = split_context_target(
                 train_idx, args.min_context_angles, args.target_angles)
             phase_raw, mean_raw, amp_raw = model.predict_all_components(
