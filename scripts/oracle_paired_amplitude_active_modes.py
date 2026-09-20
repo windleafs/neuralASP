@@ -28,7 +28,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
@@ -36,39 +35,8 @@ sys.path.insert(0, str(PROJECT))
 from common import demod_iq, rf_to_D
 from models.active_mode_phase_amplitude import ActiveModePhaseAmplitudeModel
 from physics.phase_screen import mean_controls_to_ds
+from physics.paired_amplitude_loss import paired_image_loss
 from scripts.pilot_phase_asp import DATA_ROOT, corrected_config
-
-
-def smooth_log_envelope(image, kernel: int, eps: float):
-    env = image.abs().clamp_min(eps)
-    if kernel > 1:
-        env = F.avg_pool2d(
-            env[:, None], kernel_size=kernel, stride=1,
-            padding=kernel // 2)[:, 0]
-    return torch.log(env.clamp_min(eps))
-
-
-def depth_log_energy(image, bins: int, eps: float):
-    env = image.abs().mean(dim=-1)
-    _, nz = env.shape
-    edges = torch.linspace(0, nz, bins + 1, device=image.device).round().long()
-    rows = []
-    for a, b in zip(edges[:-1], edges[1:]):
-        if int(b) <= int(a):
-            continue
-        rows.append(torch.log(env[:, int(a):int(b)].mean(dim=-1).clamp_min(eps)))
-    return torch.stack(rows, dim=-1)
-
-
-def paired_loss(current, reference, smooth_kernel, depth_bins, eps, depth_weight):
-    cur_log = smooth_log_envelope(current, smooth_kernel, eps)
-    ref_log = smooth_log_envelope(reference, smooth_kernel, eps)
-    image = (cur_log - ref_log).abs().mean()
-    cur_depth = depth_log_energy(current, depth_bins, eps)
-    ref_depth = depth_log_energy(reference, depth_bins, eps)
-    depth = (cur_depth - ref_depth).abs().mean()
-    total = image + depth_weight * depth
-    return total, image, depth
 
 
 def physical_crop(image, pad):
@@ -138,6 +106,15 @@ def load_pair(att_root, noatt_root, sample_id, device):
     noatt = torch.load(noatt_path, map_location="cpu", weights_only=False)
     if tuple(att["rf"].shape) != tuple(noatt["rf"].shape):
         raise ValueError(f"{sample_id}: paired RF shapes differ")
+    a = att["rf"].float()
+    b = noatt["rf"].float()
+    diff = (a - b).pow(2).mean().sqrt()
+    denom = a.pow(2).mean().sqrt().clamp_min(1e-20)
+    rel = float(diff / denom)
+    if rel < 1e-7:
+        raise RuntimeError(
+            f"{sample_id}: attenuated/no-att RF are numerically identical "
+            f"(relative L2 RMS={rel:.3e}); check paired dataset generation")
     return att, noatt
 
 
@@ -183,11 +160,11 @@ def evaluate_loss(model, meta, att, noatt, raw, limit_np, args):
     coeff, amp_rate = amplitude_rate_from_raw(model, raw, limit_np)
     current = physical_crop(
         compound(model, D_att, ds, amp_rate, all_idx), model.pad)
-    total, image, depth = paired_loss(
+    total, image, depth, scale = paired_image_loss(
         current, reference, args.smooth_kernel, args.depth_bins,
         args.eps, args.depth_weight)
     with torch.no_grad():
-        base_total, base_image, base_depth = paired_loss(
+        base_total, base_image, base_depth, _ = paired_image_loss(
             baseline, reference, args.smooth_kernel, args.depth_bins,
             args.eps, args.depth_weight)
     return {
@@ -199,6 +176,7 @@ def evaluate_loss(model, meta, att, noatt, raw, limit_np, args):
         "baseline_depth": base_depth,
         "coeff": coeff,
         "mean_raw": mean_raw,
+        "reference_scale": scale.detach(),
     }
 
 
@@ -225,6 +203,7 @@ def optimize_sample(model, meta, att, noatt, args, sample_id):
             "gain": float((out["baseline_total"] - out["total"]).detach()),
             "prior": float(prior.detach()),
             "max_abs_coeff_np": float(out["coeff"].detach().abs().max()),
+            "reference_scale": float(out["reference_scale"].detach().mean()),
         }
         if step == 0 or step % args.log_every == 0 or step == args.steps:
             history.append(row)
