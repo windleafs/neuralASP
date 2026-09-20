@@ -41,6 +41,7 @@ from physics.active_subspace import (
     gram_spectrum,
     linearity_diagnostics,
     subspace_overlap,
+    subspace_overlap_curve,
 )
 from physics.propagation_modes import (
     amplitude_screen_perturbation,
@@ -142,18 +143,38 @@ def build_jacobian_for_step(model, D, ds0, amp0, mask, base, modes,
     }
 
 
-def summarize_linearity(reference, test):
-    d = linearity_diagnostics(reference, test)
+def summarize_linearity(reference, test, active_rel_threshold):
+    d = linearity_diagnostics(
+        reference, test, active_rel_threshold=active_rel_threshold)
+    valid = d["valid"]
+    n_total = int(valid.numel())
+    n_active = int(valid.sum())
+    if n_active == 0:
+        return {
+            "active_columns": 0,
+            "total_columns": n_total,
+            "active_fraction": 0.0,
+            "mean_cosine": float("nan"),
+            "min_cosine": float("nan"),
+            "mean_norm_ratio": float("nan"),
+            "std_norm_ratio": float("nan"),
+            "mean_relative_error": float("nan"),
+            "max_relative_error": float("nan"),
+        }
+    cosine = d["cosine"][valid]
+    norm_ratio = d["norm_ratio"][valid]
+    relative_error = d["relative_error"][valid]
     return {
-        "mean_cosine": float(d["cosine"].mean()),
-        "min_cosine": float(d["cosine"].min()),
-        "mean_norm_ratio": float(d["norm_ratio"].mean()),
-        "std_norm_ratio": float(d["norm_ratio"].std(unbiased=False)),
-        "mean_relative_error": float(d["relative_error"].mean()),
-        "max_relative_error": float(d["relative_error"].max()),
+        "active_columns": n_active,
+        "total_columns": n_total,
+        "active_fraction": n_active / float(n_total),
+        "mean_cosine": float(cosine.mean()),
+        "min_cosine": float(cosine.min()),
+        "mean_norm_ratio": float(norm_ratio.mean()),
+        "std_norm_ratio": float(norm_ratio.std(unbiased=False)),
+        "mean_relative_error": float(relative_error.mean()),
+        "max_relative_error": float(relative_error.max()),
     }
-
-
 def compact_spectrum(rep):
     return {
         "rank_90": rep["rank_90"],
@@ -210,20 +231,41 @@ def plot_linearity(path, linearity_rows, dpi):
     amp_steps = [r["amplitude_step_np"] for r in linearity_rows]
     phase_err = [r["phase"]["mean_relative_error"] for r in linearity_rows]
     amp_err = [r["amplitude"]["mean_relative_error"] for r in linearity_rows]
-    phase_cos = [r["phase"]["mean_cosine"] for r in linearity_rows]
-    amp_cos = [r["amplitude"]["mean_cosine"] for r in linearity_rows]
+    phase_one_minus_cos = [1.0 - r["phase"]["mean_cosine"] for r in linearity_rows]
+    amp_one_minus_cos = [1.0 - r["amplitude"]["mean_cosine"] for r in linearity_rows]
+
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.3), constrained_layout=True)
-    axes[0].plot(phase_steps, phase_err, marker="o", label="phase")
-    axes[0].plot(amp_steps, amp_err, marker="o", label="amplitude")
-    axes[0].set(xlabel="Perturbation step", ylabel="Mean relative Jacobian error",
-                title="Finite-difference linearity error")
-    axes[1].plot(phase_steps, phase_cos, marker="o", label="phase")
-    axes[1].plot(amp_steps, amp_cos, marker="o", label="amplitude")
-    axes[1].set(xlabel="Perturbation step", ylabel="Mean derivative cosine",
-                title="Finite-difference direction stability", ylim=(0, 1.01))
+    axes[0].plot(phase_steps, phase_err, marker="o", label="relative error")
+    axes[0].plot(phase_steps, phase_one_minus_cos, marker="o", label="1 - cosine")
+    axes[0].set(
+        xlabel="Phase perturbation [us]", ylabel="Deviation from reference Jacobian",
+        title="Phase finite-difference linearity")
+
+    axes[1].plot(amp_steps, amp_err, marker="o", label="relative error")
+    axes[1].plot(amp_steps, amp_one_minus_cos, marker="o", label="1 - cosine")
+    axes[1].set(
+        xlabel="Amplitude perturbation [Np]", ylabel="Deviation from reference Jacobian",
+        title="Amplitude finite-difference linearity")
+
     for ax in axes:
         ax.grid(alpha=0.25)
         ax.legend()
+    fig.savefig(path, dpi=dpi)
+    plt.close(fig)
+
+
+def plot_cross_family_overlap(path, ranks, complex_overlap, log_overlap, dpi):
+    fig, ax = plt.subplots(figsize=(7.4, 4.6), constrained_layout=True)
+    ax.plot(ranks, complex_overlap, marker="o", label="complex image")
+    ax.plot(ranks, log_overlap, marker="o", label="log-envelope")
+    ax.set(
+        xlabel="Subspace rank K",
+        ylabel="Phase-amplitude subspace overlap O(K)",
+        title="Shared spatial active modes: phase vs amplitude",
+        ylim=(0.0, 1.02),
+    )
+    ax.grid(alpha=0.25)
+    ax.legend()
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
 
@@ -265,8 +307,10 @@ def analyze_one(sample_id, model, meta, train_idx, hold_idx, args):
         linearity.append({
             "phase_step_us": float(ps),
             "amplitude_step_np": float(aps),
-            "phase": summarize_linearity(ref["J_phase"], cur["J_phase"]),
-            "amplitude": summarize_linearity(ref["J_amplitude"], cur["J_amplitude"]),
+            "phase": summarize_linearity(
+                ref["J_phase"], cur["J_phase"], args.linearity_active_rel_threshold),
+            "amplitude": summarize_linearity(
+                ref["J_amplitude"], cur["J_amplitude"], args.linearity_active_rel_threshold),
         })
 
     Gp = ref["J_phase"].T @ ref["J_phase"]
@@ -301,11 +345,13 @@ def main():
     p.add_argument("--lateral-modes", type=int, default=6)
     p.add_argument("--min-depth-mm", type=float, default=2.0)
     p.add_argument("--max-depth-mm", type=float, default=38.0)
-    p.add_argument("--phase-steps-us", nargs="+", type=float, default=[0.01, 0.02, 0.04])
+    p.add_argument("--phase-steps-us", nargs="+", type=float, default=[0.0025, 0.005, 0.01])
     p.add_argument("--amplitude-steps-np", nargs="+", type=float, default=[0.01, 0.02, 0.04])
     p.add_argument("--top-frac", type=float, default=0.2)
     p.add_argument("--log-eps", type=float, default=1e-8)
     p.add_argument("--subspace-rank", type=int, default=6)
+    p.add_argument("--cross-family-max-rank", type=int, default=15)
+    p.add_argument("--linearity-active-rel-threshold", type=float, default=1e-6)
     p.add_argument("--dpi", type=int, default=160)
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
@@ -316,6 +362,10 @@ def main():
         p.error("all perturbation steps must be positive")
     if args.depth_screens < 1 or args.lateral_modes < 1:
         p.error("candidate mode counts must be positive")
+    if args.cross_family_max_rank < 1:
+        p.error("--cross-family-max-rank must be positive")
+    if args.linearity_active_rel_threshold < 0:
+        p.error("--linearity-active-rel-threshold must be non-negative")
 
     args.out.mkdir(parents=True, exist_ok=True)
     torch.cuda.set_device(args.gpu)
@@ -365,6 +415,13 @@ def main():
     rep_pl = gram_spectrum(Gpl)
     rep_al = gram_spectrum(Gal)
 
+    overlap_ranks, phase_amp_overlap = subspace_overlap_curve(
+        rep_p["Vh"], rep_a["Vh"], args.cross_family_max_rank)
+    overlap_log_ranks, phase_amp_log_overlap = subspace_overlap_curve(
+        rep_pl["Vh"], rep_al["Vh"], args.cross_family_max_rank)
+    if overlap_ranks != overlap_log_ranks:
+        raise RuntimeError("complex/log overlap rank grids do not match")
+
     pg = np.mean(np.stack(phase_global_all), axis=0)
     ag = np.mean(np.stack(amp_global_all), axis=0)
     pc = np.mean(np.stack(phase_cond_all), axis=0)
@@ -384,7 +441,8 @@ def main():
     # Average linearity diagnostics across samples at each step.
     linearity_mean = []
     for si in range(len(args.phase_steps_us)):
-        phase_keys = ["mean_cosine", "min_cosine", "mean_norm_ratio",
+        phase_keys = ["active_columns", "total_columns", "active_fraction",
+                      "mean_cosine", "min_cosine", "mean_norm_ratio",
                       "std_norm_ratio", "mean_relative_error", "max_relative_error"]
         amp_keys = phase_keys
         pmean = {key: float(np.mean([r["linearity"][si]["phase"][key]
@@ -401,14 +459,22 @@ def main():
     spectra_name = "population_propagation_active_subspace.png"
     depth_name = "population_depth_coverage_bias.png"
     linearity_name = "population_finite_difference_linearity.png"
+    overlap_name = "population_phase_amplitude_subspace_overlap.png"
     plot_population_spectra(args.out / spectra_name, rep_p, rep_a, rep_pl, rep_al, args.dpi)
     plot_depth_bias(args.out / depth_name, depths_mm, pg, pc, ag, ac, args.dpi)
     plot_linearity(args.out / linearity_name, linearity_mean, args.dpi)
+    plot_cross_family_overlap(
+        args.out / overlap_name, overlap_ranks,
+        phase_amp_overlap.detach().cpu().numpy(),
+        phase_amp_log_overlap.detach().cpu().numpy(), args.dpi)
 
     torch.save({
         "Gp": Gp.cpu(), "Ga": Ga.cpu(), "Gpl": Gpl.cpu(), "Gal": Gal.cpu(),
         "phase_Vh": rep_p["Vh"].cpu(), "amplitude_Vh": rep_a["Vh"].cpu(),
         "phase_log_Vh": rep_pl["Vh"].cpu(), "amplitude_log_Vh": rep_al["Vh"].cpu(),
+        "phase_amplitude_overlap_ranks": overlap_ranks,
+        "phase_amplitude_overlap": phase_amp_overlap.cpu(),
+        "phase_amplitude_log_overlap": phase_amp_log_overlap.cpu(),
         "labels_phase": sample_results[0]["labels_phase"],
         "labels_amplitude": sample_results[0]["labels_amplitude"],
         "depths_mm": depths_mm,
@@ -428,6 +494,14 @@ def main():
             "mean_amplitude_subspace_overlap": float(np.mean(amp_overlap)),
             "min_amplitude_subspace_overlap": float(np.min(amp_overlap)),
             "subspace_rank_for_overlap": int(k),
+            "phase_amplitude_overlap": {
+                "ranks": overlap_ranks,
+                "complex": phase_amp_overlap.detach().cpu().tolist(),
+                "log_envelope": phase_amp_log_overlap.detach().cpu().tolist(),
+                "complex_at_rank6": float(phase_amp_overlap[min(5, len(phase_amp_overlap)-1)]),
+                "log_envelope_at_rank6": float(
+                    phase_amp_log_overlap[min(5, len(phase_amp_log_overlap)-1)]),
+            },
         },
         "linearity_mean": linearity_mean,
         "depth_bias": {
@@ -452,6 +526,7 @@ def main():
             "spectra": spectra_name,
             "depth_bias": depth_name,
             "linearity": linearity_name,
+            "phase_amplitude_overlap": overlap_name,
         },
     }
     (args.out / "multisample_active_subspace_summary.json").write_text(
