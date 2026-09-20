@@ -109,6 +109,7 @@ class ActiveModePhaseAmplitudeModel(PhaseScreenModel):
         self.active_depth_indices = list(templates["depth_indices"])
         self.active_depths_mm = list(basis["depths_mm"])
         self.active_candidate_dim = int(basis["candidate_dim"])
+        self.active_relative_only = bool(basis.get("relative_only", False))
 
     def phase_gate_value(self):
         return torch.sigmoid(self.phase_gate_logit)

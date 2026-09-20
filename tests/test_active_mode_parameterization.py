@@ -71,3 +71,24 @@ def test_balanced_basis_ignores_phase_amplitude_unit_scaling(tmp_path):
     b = load_shared_active_basis(path2, rank=3, source="balanced")["Vh"]
     # Eigenvector signs are arbitrary; compare projectors.
     torch.testing.assert_close(a.T @ a, b.T @ b, atol=1e-5, rtol=1e-5)
+
+
+def test_relative_basis_templates_have_zero_physical_lateral_mean(tmp_path):
+    path = tmp_path / "relative.pt"
+    synthetic_population_artifact(path)
+    p = torch.load(path, weights_only=False)
+    p["relative_only"] = True
+    # Deliberately choose common-mode eigenvectors; template builder must still
+    # enforce zero lateral mean for a relative-only artifact.
+    torch.save(p, path)
+    basis = load_shared_active_basis(path, rank=2, source="phase")
+    tpl = build_active_mode_templates(
+        basis, nz=10, nx=12, dz_m=1e-3, z0_m=0.0, pad=2)
+    phase = tpl["phase_unit_ds"][..., 2:-2]
+    amp = tpl["amplitude_unit_rate"][..., 2:-2]
+    torch.testing.assert_close(
+        phase.mean(dim=-1), torch.zeros_like(phase.mean(dim=-1)),
+        atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        amp.mean(dim=-1), torch.zeros_like(amp.mean(dim=-1)),
+        atol=1e-6, rtol=1e-6)
