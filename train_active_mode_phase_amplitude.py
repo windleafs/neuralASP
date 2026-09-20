@@ -35,7 +35,6 @@ from models.phase_screen import heldout_agreement
 from scripts.pilot_phase_asp import DATA_ROOT, corrected_config
 from train_phase_screen import build_cache, sample_ids
 from train_phase_screen_cross_angle import split_context_target
-from train_phase_screen_staged import _warm_start_learned_weights
 
 
 def plain_args(args):
@@ -185,26 +184,53 @@ def validate_phase(model, cache, train_idx, hold_idx):
     model.eval()
     rows = []
     for item in cache:
-        out = model.forward_precomputed(item["iq"], item["D"], train_idx)
-        zero_amp = torch.zeros_like(out["amplitude_rate"])
-        tr = model.angle_images(
-            out["effective_ds"], item["D"], train_idx, amplitude_rate=zero_amp)
-        ho = model.angle_images(
-            out["effective_ds"], item["D"], hold_idx, amplitude_rate=zero_amp)
+        phase_raw, mean_raw, amp_raw = model.predict_all_components(
+            item["iq"], train_idx)
+        ds_full, amp_rate, phase_coeff, _ = model.network_corrections(
+            phase_raw, mean_raw, amp_raw)
+        ds_mean = mean_controls_to_ds(
+            mean_raw, model.born.nz, model.born.nx, model.born.dz,
+            model.mean_limit_us)
+        zero_amp = torch.zeros_like(amp_rate)
         ref = item["ref"]
-        hold = heldout_agreement(
-            tr, ho, ref["mask"], ref["train_scales"], ref["hold_scales"])
+
+        tr_full = model.angle_images(
+            ds_full, item["D"], train_idx, amplitude_rate=zero_amp)
+        ho_full = model.angle_images(
+            ds_full, item["D"], hold_idx, amplitude_rate=zero_amp)
+        full_hold = heldout_agreement(
+            tr_full, ho_full, ref["mask"],
+            ref["train_scales"], ref["hold_scales"])
+
+        tr_mean = model.angle_images(
+            ds_mean, item["D"], train_idx, amplitude_rate=zero_amp)
+        ho_mean = model.angle_images(
+            ds_mean, item["D"], hold_idx, amplitude_rate=zero_amp)
+        mean_hold = heldout_agreement(
+            tr_mean, ho_mean, ref["mask"],
+            ref["train_scales"], ref["hold_scales"])
+
+        uniform = float(ref["uniform_holdout_agreement"][0])
+        full_value = float(full_hold[0])
+        mean_value = float(mean_hold[0])
         rows.append({
             "sample": item["id"],
-            "uniform_hold": float(ref["uniform_holdout_agreement"][0]),
-            "phase_hold": float(hold[0]),
-            "max_phase_coeff_us": float(out["phase_coeff_us"].abs().max()),
+            "uniform_hold": uniform,
+            "mean_only_hold": mean_value,
+            "phase_hold": full_value,
+            "gain_active_on_top_of_mean": full_value - mean_value,
+            "max_phase_coeff_us": float(phase_coeff.abs().max()),
         })
     return {
         "mean_uniform_hold": float(np.mean([r["uniform_hold"] for r in rows])),
+        "mean_mean_only_hold": float(np.mean([r["mean_only_hold"] for r in rows])),
         "mean_phase_hold": float(np.mean([r["phase_hold"] for r in rows])),
         "delta_phase_vs_uniform": float(np.mean([
             r["phase_hold"] - r["uniform_hold"] for r in rows])),
+        "delta_active_on_top_of_mean": float(np.mean([
+            r["gain_active_on_top_of_mean"] for r in rows])),
+        "active_wins_vs_mean_count": int(sum(
+            r["phase_hold"] > r["mean_only_hold"] for r in rows)),
         "phase_gate": float(model.phase_gate_value()),
         "rows": rows,
     }
@@ -358,7 +384,11 @@ def main():
         nonlocal best_score
         if args.stage in ("phase", "relative-phase"):
             report = validate_phase(model, val_cache, train_idx, hold_idx)
-            score = report["delta_phase_vs_uniform"]
+            score = (
+                report["delta_active_on_top_of_mean"]
+                if args.stage == "relative-phase"
+                else report["delta_phase_vs_uniform"]
+            )
         else:
             report = validate_paired_amplitude(
                 model, val_cache, paired_val, train_idx,
