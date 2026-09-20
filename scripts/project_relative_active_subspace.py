@@ -16,9 +16,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import torch
+
+PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
 
 from physics.active_subspace import gram_spectrum
 from physics.relative_active_subspace import (
