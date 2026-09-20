@@ -75,6 +75,8 @@ def load_shared_active_basis(path, rank: int = 6, source: str = "balanced"):
         "candidate_dim": int(Gp.shape[0]),
         "source": source,
         "path": str(path),
+        "relative_only": bool(payload.get("relative_only", False)),
+        "common_mode_removed": payload.get("common_mode_removed"),
     }
 
 
@@ -112,6 +114,17 @@ def build_active_mode_templates(basis, *, nz: int, nx: int, dz_m: float,
     A = torch.stack(amp_candidates, dim=0)
     phase_templates = torch.einsum("kp,pzx->kzx", Vh, P)
     amp_templates = torch.einsum("kp,pzx->kzx", Vh, A)
+
+    if basis.get("relative_only", False):
+        # Numerical eigenspaces of a projected Gram can be arbitrary inside
+        # exact/near-zero nullspaces. Enforce the intended quotient space again
+        # on the physical aperture so every depth slice has zero lateral mean.
+        sl = slice(pad, nx - pad) if pad else slice(None)
+        phase_mean = phase_templates[..., sl].mean(dim=-1, keepdim=True)
+        amp_mean = amp_templates[..., sl].mean(dim=-1, keepdim=True)
+        phase_templates = phase_templates - phase_mean
+        amp_templates = amp_templates - amp_mean
+
     return {
         "phase_unit_ds": phase_templates,
         "amplitude_unit_rate": amp_templates,
